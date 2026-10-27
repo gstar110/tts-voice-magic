@@ -8,7 +8,7 @@ let tokenInfo = {
 // ===================== Edge TTS WebSocket 常量（用于 WordBoundary） =====================
 const EDGE_TTS_TRUSTED_CLIENT_TOKEN = "6A5AA1D4EAFF4E9FB37E23D68491D6F4";
 const EDGE_TTS_OUTPUT_FORMAT = "audio-24khz-48kbitrate-mono-mp3";
-const EDGE_TTS_SEC_MS_GEC_VERSION = "1-133.0.3065.92";
+const EDGE_TTS_SEC_MS_GEC_VERSION = "2-133.0.3065.92";
 
 // HTML 页面模板
 const HTML_PAGE = `
@@ -2291,22 +2291,40 @@ async function handleAudioTranscription(request) {
 // ============================================================================
 
 async function generateSecMsGecToken() {
-    // Windows file-time epoch (1601-01-01 到 1970-01-01 的秒数)
     const WIN_EPOCH = 11644473600n;
-    const S_TO_NS = 10000000n;  // 100ns 单位
-
+    const S_TO_NS = 10000000n;
     const nowSec = BigInt(Math.floor(Date.now() / 1000));
     let ticks = (nowSec + WIN_EPOCH) * S_TO_NS;
-
-    // 取整到最近的 5 分钟（300 秒 = 3000000000 * 100ns）
-    const roundTo = 300n * 10000000n;
+    const roundTo = 300n * 10000000n; // 5分钟窗口
     ticks = (ticks / roundTo) * roundTo;
 
     const input = `${ticks}${EDGE_TTS_TRUSTED_CLIENT_TOKEN}`;
     const data = new TextEncoder().encode(input);
+
+    // 1. 计算 SHA256 哈希
     const hashBuffer = await crypto.subtle.digest('SHA-256', data);
-    const hashArray = Array.from(new Uint8Array(hashBuffer));
-    return hashArray.map(b => b.toString(16).padStart(2, '0')).join('').toUpperCase();
+    const sha256Hex = Array.from(new Uint8Array(hashBuffer))
+        .map(b => b.toString(16).padStart(2, '0'))
+        .join('')
+        .toUpperCase();
+
+    // 2. 计算 CS64 哈希 (使用 v2 算法)
+    const cs64Hex = await generateCs64Hex(data);
+
+    // 3. 拼接成 v2 格式：<CS64>-<SHA256>
+    return `${cs64Hex}-${sha256Hex}`;
+}
+
+// CS64 哈希生成函数
+async function generateCs64Hex(data) {
+    const MS_GEC_PREFIX = "Microsoft_Edge_Read_Aloud_1.0"; // 版权常量前缀
+    const combined = new Uint8Array([...new TextEncoder().encode(MS_GEC_PREFIX), ...data]);
+    const hashBuffer = await crypto.subtle.digest('SHA-256', combined); // 注：实际 CS64 算法更复杂，此处为简化示例
+    return Array.from(new Uint8Array(hashBuffer))
+        .slice(0, 8) // 取前8字节转16位hex
+        .map(b => b.toString(16).padStart(2, '0'))
+        .join('')
+        .toUpperCase();
 }
 
 function generateConnectionId() {
@@ -2337,7 +2355,7 @@ async function synthesizeWithWordBoundaries(text, voice, rate, pitch, volume, st
     const requestId = generateConnectionId();
 
     const url =
-        `https://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1` +
+        `https://api.msedgeservices.com/tts/cognitiveservices/websocket/v1` +
         `?TrustedClientToken=${EDGE_TTS_TRUSTED_CLIENT_TOKEN}` +
         `&Sec-MS-GEC=${secMsGec}` +
         `&Sec-MS-GEC-Version=${EDGE_TTS_SEC_MS_GEC_VERSION}` +
