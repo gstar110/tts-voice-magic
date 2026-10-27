@@ -8,934 +8,9 @@ let tokenInfo = {
 // ===================== Edge TTS WebSocket 常量（用于 WordBoundary） =====================
 const EDGE_TTS_TRUSTED_CLIENT_TOKEN = "6A5AA1D4EAFF4E9FB37E23D68491D6F4";
 const EDGE_TTS_OUTPUT_FORMAT = "audio-24khz-48kbitrate-mono-mp3";
+const EDGE_TTS_SEC_MS_GEC_VERSION = "1-133.0.3065.92";
 
-// ★ v2 令牌格式：前缀必须为 "2-"
-const EDGE_TTS_SEC_MS_GEC_VERSION = "2-143.0.3650.75";
-
-// ★ v2 算法使用的固定版权字符串
-const EDGE_TTS_COPYRIGHT = "Copyright (C) Microsoft Corporation. All rights reserved.";
-
-// 合成端点（新主机优先，旧主机作为后备）
-const SYNTHESIS_ENDPOINTS = [
-    {
-        host: "api.msedgeservices.com",
-        path: "/tts/cognitiveservices/websocket/v1",
-        tokenParam: "Ocp-Apim-Subscription-Key"
-    },
-    {
-        host: "speech.platform.bing.com",
-        path: "/consumer/speech/synthesize/readaloud/edge/v1",
-        tokenParam: "TrustedClientToken"
-    }
-];
-
-// ===================== v2 令牌生成 =====================
-
-/**
- * CS64 哈希（基于 32 位无符号整数运算）
- * 参考 Python 实现：rany2/edge-tts/src/edge_tts/drm.py 中的 _cs64_digest
- */
-function cs64Hash(bytes) {
-    const MASK = 0xFFFFFFFF;
-    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-    const words = [];
-    for (let i = 0; i + 4 <= bytes.length; i += 4) {
-        words.push(view.getUint32(i, true));
-    }
-
-    // 密钥常量（与 Python 参考实现保持一致）
-    const KEY_A = 0x8A5CD789;
-    const KEY_B = 0x5C0D5E1F;
-
-    let v0 = (KEY_A ^ (words[0] || 0)) >>> 0;
-    let v1 = (KEY_B ^ (words[1] || 0)) >>> 0;
-
-    for (let i = 2; i < words.length; i += 2) {
-        v0 = (Math.imul(v0, 0x9E3779B9) + words[i]) >>> 0;
-        v1 = (Math.imul(v1, 0x9E3779B9) + (words[i + 1] || 0)) >>> 0;
-        v0 = ((v0 << 13) | (v0 >>> 19)) >>> 0;
-        v1 = ((v1 << 17) | (v1 >>> 15)) >>> 0;
-    }
-
-    const high = (v0 >>> 0).toString(16).padStart(8, '0');
-    const low = (v1 >>> 0).toString(16).padStart(8, '0');
-    return (high + low).toUpperCase();
-}
-
-/**
- * 生成 Sec-MS-GEC v2 令牌
- * 返回格式：<16位CS64哈希>-<64位SHA256哈希>
- */
-async function generateSecMsGecToken() {
-    const WIN_EPOCH = 11644473600n;
-    const S_TO_NS = 10000000n;
-
-    const nowSec = BigInt(Math.floor(Date.now() / 1000));
-    let ticks = (nowSec + WIN_EPOCH) * S_TO_NS;
-    const roundTo = 300n * 10000000n;
-    ticks = (ticks / roundTo) * roundTo;
-
-    // ★ v2: 在 ticks + token 前拼接版权字符串
-    const input = `${EDGE_TTS_COPYRIGHT}${ticks}${EDGE_TTS_TRUSTED_CLIENT_TOKEN}`;
-    const data = new TextEncoder().encode(input);
-
-    // 1) CS64 部分（16 位 hex）
-    const cs64 = cs64Hash(data);
-
-    // 2) SHA-256 部分（64 位 hex）
-    const hashBuffer = await crypto.subtle.digest('SHA-256', data);
-    const hashArray = Array.from(new Uint8Array(hashBuffer));
-    const sha256 = hashArray.map(b => b.toString(16).padStart(2, '0')).join('').toUpperCase();
-
-    return `${cs64}-${sha256}`;
-}
-
-// ===================== 以下为 Worker 完整实现 =====================
-
-function generateConnectionId() {
-    return crypto.randomUUID().replace(/-/g, '');
-}
-
-function arrayBufferToBase64(buffer) {
-    let binary = '';
-    const bytes = new Uint8Array(buffer);
-    const chunkSize = 0x8000;
-    for (let i = 0; i < bytes.length; i += chunkSize) {
-        binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
-    }
-    return btoa(binary);
-}
-
-function buildSynthesisUrl(endpoint, secMsGec, connectionId) {
-    const params = new URLSearchParams({
-        [endpoint.tokenParam]: EDGE_TTS_TRUSTED_CLIENT_TOKEN,
-        'Sec-MS-GEC': secMsGec,
-        'Sec-MS-GEC-Version': EDGE_TTS_SEC_MS_GEC_VERSION,
-        'ConnectionId': connectionId
-    });
-    return `https://${endpoint.host}${endpoint.path}?${params.toString()}`;
-}
-
-async function synthesizeWithWordBoundaries(text, voice, rate, pitch, volume, style) {
-    const secMsGec = await generateSecMsGecToken();
-    const connectionId = generateConnectionId();
-    const requestId = generateConnectionId();
-
-    let lastError = null;
-
-    for (const endpoint of SYNTHESIS_ENDPOINTS) {
-        const url = buildSynthesisUrl(endpoint, secMsGec, connectionId);
-
-        let resp;
-        try {
-            resp = await fetch(url, {
-                headers: {
-                    'Upgrade': 'websocket',
-                    'Connection': 'Upgrade',
-                    'Sec-WebSocket-Version': '13',
-                    'Origin': 'chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold',
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36 Edg/132.0.0.0',
-                    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8'
-                }
-            });
-        } catch (fetchError) {
-            lastError = fetchError;
-            continue;
-        }
-
-        if (resp.status !== 101) {
-            let detail = '';
-            try { detail = await resp.text(); } catch (e) {}
-            lastError = new Error(`WebSocket 升级失败 (HTTP ${resp.status})${detail ? ': ' + detail.slice(0, 200) : ''}`);
-            continue;
-        }
-
-        const ws = resp.webSocket;
-        if (!ws) {
-            lastError = new Error('WebSocket 升级失败：response.webSocket 为空');
-            continue;
-        }
-
-        return await runWebSocketSession(ws, text, voice, rate, pitch, volume, style, requestId);
-    }
-
-    throw lastError || new Error('所有 Edge TTS 合成端点均连接失败');
-}
-
-function runWebSocketSession(ws, text, voice, rate, pitch, volume, style, requestId) {
-    ws.accept();
-
-    return new Promise((resolve, reject) => {
-        const audioChunks = [];
-        const wordBoundaries = [];
-        let resolved = false;
-        let pendingBinary = Promise.resolve();
-
-        const cleanup = () => { try { ws.close(); } catch (e) {} };
-        const fail = (err) => {
-            if (resolved) return;
-            resolved = true;
-            cleanup();
-            reject(err);
-        };
-
-        const timeout = setTimeout(() => fail(new Error('Edge TTS 连接超时')), 25000);
-
-        ws.addEventListener('message', (event) => {
-            const data = event.data;
-
-            if (typeof data === 'string') {
-                if (data.indexOf('Path:audio.metadata') !== -1) {
-                    const jsonStart = data.indexOf('{');
-                    if (jsonStart !== -1) {
-                        try {
-                            const meta = JSON.parse(data.slice(jsonStart));
-                            if (meta && Array.isArray(meta.Metadata)) {
-                                for (const item of meta.Metadata) {
-                                    if (item.Type === 'WordBoundary' && item.Data) {
-                                        wordBoundaries.push({
-                                            text: item.Data.text && item.Data.text.Text ? item.Data.text.Text : '',
-                                            offsetSec: item.Data.Offset / 10000000,
-                                            durationSec: item.Data.Duration / 10000000
-                                        });
-                                    }
-                                }
-                            }
-                        } catch (e) {}
-                    }
-                }
-                if (data.indexOf('Path:turn.end') !== -1) {
-                    clearTimeout(timeout);
-                    pendingBinary.then(() => {
-                        if (resolved) return;
-                        resolved = true;
-                        cleanup();
-                        resolve({ audioChunks, wordBoundaries });
-                    });
-                }
-                return;
-            }
-
-            let bufferPromise;
-            if (data instanceof ArrayBuffer) {
-                bufferPromise = Promise.resolve(data);
-            } else if (ArrayBuffer.isView(data)) {
-                bufferPromise = Promise.resolve(data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength));
-            } else if (data && typeof data.arrayBuffer === 'function') {
-                bufferPromise = data.arrayBuffer();
-            } else {
-                return;
-            }
-
-            pendingBinary = pendingBinary.then(() => {
-                return bufferPromise.then((buffer) => {
-                    if (!buffer || buffer.byteLength < 2) return;
-                    const view = new DataView(buffer);
-                    const headerLength = view.getUint16(0, false);
-                    if (buffer.byteLength < 2 + headerLength) return;
-                    const headerText = new TextDecoder().decode(new Uint8Array(buffer, 2, headerLength));
-                    if (headerText.indexOf('Path:audio') !== -1) {
-                        const audioData = buffer.slice(2 + headerLength);
-                        if (audioData.byteLength > 0) audioChunks.push(audioData);
-                    }
-                });
-            });
-        });
-
-        ws.addEventListener('close', (e) => {
-            clearTimeout(timeout);
-            if (!resolved) {
-                pendingBinary.then(() => {
-                    if (!resolved) {
-                        if (audioChunks.length > 0) {
-                            resolved = true;
-                            resolve({ audioChunks, wordBoundaries });
-                        } else {
-                            fail(new Error(`Edge TTS 连接关闭 (code ${e.code})`));
-                        }
-                    }
-                });
-            }
-        });
-
-        ws.addEventListener('error', () => {
-            clearTimeout(timeout);
-            fail(new Error('Edge TTS WebSocket 错误事件'));
-        });
-
-        try {
-            const configMsg = {
-                context: {
-                    synthesis: {
-                        audio: {
-                            metadataoptions: { sentenceBoundaryEnabled: false, wordBoundaryEnabled: true },
-                            outputFormat: EDGE_TTS_OUTPUT_FORMAT
-                        }
-                    }
-                }
-            };
-            ws.send(
-                `X-Timestamp:${Date.now() / 1000}\r\n` +
-                `Content-Type:application/json; charset=utf-8\r\n` +
-                `Path:speech.config\r\n\r\n` + JSON.stringify(configMsg)
-            );
-
-            const ssml = buildEdgeSSML(text, voice, rate, pitch, volume, style);
-            ws.send(
-                `X-RequestId:${requestId}\r\n` +
-                `Content-Type:application/ssml+xml\r\n` +
-                `X-Timestamp:${new Date().toISOString()}\r\n` +
-                `Path:ssml\r\n\r\n` + ssml
-            );
-        } catch (e) {
-            clearTimeout(timeout);
-            fail(new Error('发送 SSML 失败: ' + e.message));
-        }
-    });
-}
-
-async function handleSpeechWithTimings(request) {
-    try {
-        const requestBody = await request.json();
-        const {
-            input,
-            voice = "zh-CN-XiaoxiaoNeural",
-            speed = '1.0',
-            volume = '0',
-            pitch = '0',
-            style = "general"
-        } = requestBody;
-
-        if (!input || !input.trim()) {
-            return new Response(JSON.stringify({ error: { message: "输入文本不能为空" } }), {
-                status: 400, headers: { "Content-Type": "application/json", ...makeCORSHeaders() }
-            });
-        }
-        if (input.length > 2000) {
-            return new Response(JSON.stringify({ error: { message: "文本过长（超过 2000 字符）" } }), {
-                status: 400, headers: { "Content-Type": "application/json", ...makeCORSHeaders() }
-            });
-        }
-
-        const parsedSpeed = parseFloat(speed);
-        const rate = isNaN(parsedSpeed) ? 0 : parseInt(String((parsedSpeed - 1.0) * 100));
-        const parsedVolume = parseFloat(volume);
-        const numVolume = isNaN(parsedVolume) ? 0 : parseInt(String(parsedVolume * 100));
-        const parsedPitch = parseInt(pitch);
-        const numPitch = isNaN(parsedPitch) ? 0 : parsedPitch;
-
-        const rateStr = rate >= 0 ? `+${rate}%` : `${rate}%`;
-        const pitchStr = numPitch >= 0 ? `+${numPitch}Hz` : `${numPitch}Hz`;
-        const volumeStr = numVolume >= 0 ? `+${numVolume}%` : `${numVolume}%`;
-
-        const { audioChunks, wordBoundaries } = await synthesizeWithWordBoundaries(
-            input.trim(), voice, rateStr, pitchStr, volumeStr, style
-        );
-
-        if (!audioChunks.length) throw new Error('Edge TTS 未返回任何音频数据');
-
-        let totalLength = 0;
-        for (const chunk of audioChunks) totalLength += chunk.byteLength;
-        const merged = new Uint8Array(totalLength);
-        let offset = 0;
-        for (const chunk of audioChunks) {
-            merged.set(new Uint8Array(chunk), offset);
-            offset += chunk.byteLength;
-        }
-
-        const base64Audio = arrayBufferToBase64(merged.buffer);
-
-        return new Response(JSON.stringify({
-            audio: base64Audio,
-            format: 'audio/mpeg',
-            wordBoundaries
-        }), {
-            headers: { "Content-Type": "application/json", ...makeCORSHeaders() }
-        });
-
-    } catch (error) {
-        console.error("Speech with timings error:", error);
-        return new Response(JSON.stringify({
-            error: { message: error.message || String(error), type: "api_error", code: "edge_tts_timings_error" }
-        }), {
-            status: 500, headers: { "Content-Type": "application/json", ...makeCORSHeaders() }
-        });
-    }
-}
-
-function buildEdgeSSML(text, voice, rate, pitch, volume, style) {
-    const escapedText = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;');
-    const parts = String(voice || '').split('-');
-    const lang = parts.length >= 2 ? `${parts[0]}-${parts[1]}` : 'en-US';
-    let inner = escapedText;
-    if (style && style !== 'general' && style !== 'default' && style.trim() !== '') {
-        inner = `<mstts:express-as style="${style}" styledegree="2.0">${inner}</mstts:express-as>`;
-    }
-    return `<speak xmlns="http://www.w3.org/2001/10/synthesis" xmlns:mstts="http://www.w3.org/2001/mstts" version="1.0" xml:lang="${lang}"><voice name="${voice}"><prosody rate="${rate}" pitch="${pitch}" volume="${volume}">${inner}</prosody></voice></speak>`;
-}
-
-function makeCORSHeaders() {
-    return {
-        "Access-Control-Allow-Origin": "*",
-        "Access-Control-Allow-Methods": "GET,HEAD,POST,OPTIONS",
-        "Access-Control-Allow-Headers": "Content-Type, x-api-key",
-        "Access-Control-Max-Age": "86400"
-    };
-}
-
-async function handleOptions(request) {
-    return new Response(null, {
-        status: 204,
-        headers: {
-            ...makeCORSHeaders(),
-            "Access-Control-Allow-Methods": "GET,HEAD,POST,OPTIONS",
-            "Access-Control-Allow-Headers": request.headers.get("Access-Control-Request-Headers") || "Authorization"
-        }
-    });
-}
-
-function delay(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-function optimizedTextSplit(text, maxChunkSize = 1500) {
-    const chunks = [];
-    const sentences = text.split(/[。！？\n]/);
-    let currentChunk = '';
-    
-    for (const sentence of sentences) {
-        const trimmedSentence = sentence.trim();
-        if (!trimmedSentence) continue;
-        
-        if (trimmedSentence.length > maxChunkSize) {
-            if (currentChunk) {
-                chunks.push(currentChunk.trim());
-                currentChunk = '';
-            }
-            for (let i = 0; i < trimmedSentence.length; i += maxChunkSize) {
-                chunks.push(trimmedSentence.slice(i, i + maxChunkSize));
-            }
-        } else if ((currentChunk + trimmedSentence).length > maxChunkSize) {
-            if (currentChunk) chunks.push(currentChunk.trim());
-            currentChunk = trimmedSentence;
-        } else {
-            currentChunk += (currentChunk ? '。' : '') + trimmedSentence;
-        }
-    }
-    
-    if (currentChunk.trim()) chunks.push(currentChunk.trim());
-    return chunks.filter(chunk => chunk.length > 0);
-}
-
-async function processBatchedAudioChunks(chunks, voiceName, rate, pitch, volume, style, outputFormat, batchSize = 3, delayMs = 1000) {
-    const audioChunks = [];
-    
-    for (let i = 0; i < chunks.length; i += batchSize) {
-        const batch = chunks.slice(i, i + batchSize);
-        const batchPromises = batch.map(async (chunk, index) => {
-            try {
-                if (index > 0) await delay(index * 200);
-                return await getAudioChunk(chunk, voiceName, rate, pitch, volume, style, outputFormat);
-            } catch (error) {
-                console.error(`处理音频块失败 (批次 ${Math.floor(i/batchSize) + 1}, 块 ${index + 1}):`, error);
-                throw error;
-            }
-        });
-        
-        try {
-            const batchResults = await Promise.all(batchPromises);
-            audioChunks.push(...batchResults);
-            if (i + batchSize < chunks.length) await delay(delayMs);
-        } catch (error) {
-            console.error(`批次处理失败:`, error);
-            throw error;
-        }
-    }
-    
-    return audioChunks;
-}
-
-async function getVoice(text, voiceName = "zh-CN-XiaoxiaoNeural", rate = '+0%', pitch = '+0Hz', volume = '+0%', style = "general", outputFormat = "audio-24khz-48kbitrate-mono-mp3") {
-    try {
-        const cleanText = text.trim();
-        if (!cleanText) throw new Error("文本内容为空");
-        
-        if (cleanText.length <= 1500) {
-            const audioBlob = await getAudioChunk(cleanText, voiceName, rate, pitch, volume, style, outputFormat);
-            return new Response(audioBlob, {
-                headers: { "Content-Type": "audio/mpeg", ...makeCORSHeaders() }
-            });
-        }
-
-        const chunks = optimizedTextSplit(cleanText, 1500);
-        
-        if (chunks.length > 40) {
-            throw new Error(`文本过长，分块数量(${chunks.length})超过限制。请缩短文本或分批处理。`);
-        }
-        
-        console.log(`文本已分为 ${chunks.length} 个块进行处理`);
-
-        const audioChunks = await processBatchedAudioChunks(
-            chunks, voiceName, rate, pitch, volume, style, outputFormat, 3, 800
-        );
-
-        const concatenatedAudio = new Blob(audioChunks, { type: 'audio/mpeg' });
-        return new Response(concatenatedAudio, {
-            headers: { "Content-Type": "audio/mpeg", ...makeCORSHeaders() }
-        });
-
-    } catch (error) {
-        console.error("语音合成失败:", error);
-        return new Response(JSON.stringify({
-            error: {
-                message: error.message || String(error),
-                type: "api_error",
-                param: `${voiceName}, ${rate}, ${pitch}, ${volume}, ${style}, ${outputFormat}`,
-                code: "edge_tts_error"
-            }
-        }), {
-            status: 500,
-            headers: { "Content-Type": "application/json", ...makeCORSHeaders() }
-        });
-    }
-}
-
-async function getAudioChunk(text, voiceName, rate, pitch, volume, style, outputFormat = 'audio-24khz-48kbitrate-mono-mp3', maxRetries = 3) {
-    const retryDelay = 500;
-    
-    for (let attempt = 0; attempt <= maxRetries; attempt++) {
-        try {
-            const endpoint = await getEndpoint();
-            const url = `https://${endpoint.r}.tts.speech.microsoft.com/cognitiveservices/v1`;
-            
-            let m = text.match(/\[(\d+)\]\s*?$/);
-            let slien = 0;
-            if (m && m.length == 2) {
-                slien = parseInt(m[1]);
-                text = text.replace(m[0], '');
-            }
-            
-            if (!text.trim()) throw new Error("文本块为空");
-            if (text.length > 2000) throw new Error(`文本块过长: ${text.length} 字符，最大支持2000字符`);
-            
-            const response = await fetch(url, {
-                method: "POST",
-                headers: {
-                    "Authorization": endpoint.t,
-                    "Content-Type": "application/ssml+xml",
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36 Edg/127.0.0.0",
-                    "X-Microsoft-OutputFormat": outputFormat
-                },
-                body: getSsml(text, voiceName, rate, pitch, volume, style, slien)
-            });
-
-            if (!response.ok) {
-                const errorText = await response.text();
-                
-                if (response.status === 429) {
-                    if (attempt < maxRetries) {
-                        console.log(`频率限制，第${attempt + 1}次重试，等待${retryDelay * (attempt + 1)}ms`);
-                        await delay(retryDelay * (attempt + 1));
-                        continue;
-                    }
-                    throw new Error(`请求频率过高，已重试${maxRetries}次仍失败`);
-                } else if (response.status >= 500) {
-                    if (attempt < maxRetries) {
-                        console.log(`服务器错误，第${attempt + 1}次重试，等待${retryDelay * (attempt + 1)}ms`);
-                        await delay(retryDelay * (attempt + 1));
-                        continue;
-                    }
-                    throw new Error(`Edge TTS服务器错误: ${response.status} ${errorText}`);
-                } else {
-                    throw new Error(`Edge TTS API错误: ${response.status} ${errorText}`);
-                }
-            }
-
-            return await response.blob();
-            
-        } catch (error) {
-            if (attempt === maxRetries) {
-                throw new Error(`音频生成失败（已重试${maxRetries}次）: ${error.message}`);
-            }
-            if (error.message.includes('fetch') || error.message.includes('network')) {
-                console.log(`网络错误，第${attempt + 1}次重试，等待${retryDelay * (attempt + 1)}ms`);
-                await delay(retryDelay * (attempt + 1));
-                continue;
-            }
-            throw error;
-        }
-    }
-}
-
-function escapeXmlText(text) {
-    return text
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;')
-        .replace(/'/g, '&apos;');
-}
-
-function getSsml(text, voiceName, rate, pitch, volume, style, slien = 0) {
-    const escapedText = escapeXmlText(text);
-
-    let slien_str = '';
-    if (slien > 0) {
-        slien_str = `<break time="${slien}ms" />`;
-    }
-
-    let inner = escapedText;
-    if (style && style !== 'general' && style !== 'default' && style.trim() !== '') {
-        inner = `<mstts:express-as style="${style}" styledegree="2.0">${inner}</mstts:express-as>`;
-    }
-
-    return `<speak xmlns="http://www.w3.org/2001/10/synthesis" xmlns:mstts="http://www.w3.org/2001/mstts" version="1.0" xml:lang="zh-CN">` +
-           `<voice name="${voiceName}">` +
-           `<prosody rate="${rate}" pitch="${pitch}" volume="${volume}">` +
-           inner +
-           `</prosody>` +
-           slien_str +
-           `</voice>` +
-           `</speak>`;
-}
-
-async function getEndpoint() {
-    const now = Date.now() / 1000;
-
-    if (tokenInfo.token && tokenInfo.expiredAt && now < tokenInfo.expiredAt - TOKEN_REFRESH_BEFORE_EXPIRY) {
-        return tokenInfo.endpoint;
-    }
-
-    const endpointUrl = "https://dev.microsofttranslator.com/apps/endpoint?api-version=1.0";
-    const clientId = crypto.randomUUID().replace(/-/g, "");
-
-    try {
-        const response = await fetch(endpointUrl, {
-            method: "POST",
-            headers: {
-                "Accept-Language": "zh-Hans",
-                "X-ClientVersion": "4.0.530a 5fe1dc6c",
-                "X-UserId": "0f04d16a175c411e",
-                "X-HomeGeographicRegion": "zh-Hans-CN",
-                "X-ClientTraceId": clientId,
-                "X-MT-Signature": await sign(endpointUrl),
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36 Edg/127.0.0.0",
-                "Content-Type": "application/json; charset=utf-8",
-                "Content-Length": "0",
-                "Accept-Encoding": "gzip"
-            }
-        });
-
-        if (!response.ok) {
-            throw new Error(`获取endpoint失败: ${response.status}`);
-        }
-
-        const data = await response.json();
-        const jwt = data.t.split(".")[1];
-        const decodedJwt = JSON.parse(atob(jwt));
-
-        tokenInfo = {
-            endpoint: data,
-            token: data.t,
-            expiredAt: decodedJwt.exp
-        };
-
-        return data;
-
-    } catch (error) {
-        console.error("获取endpoint失败:", error);
-        if (tokenInfo.token) {
-            console.log("使用过期的缓存token");
-            return tokenInfo.endpoint;
-        }
-        throw error;
-    }
-}
-
-async function hmacSha256(key, data) {
-    const cryptoKey = await crypto.subtle.importKey(
-        "raw",
-        key,
-        { name: "HMAC", hash: { name: "SHA-256" } },
-        false,
-        ["sign"]
-    );
-    const signature = await crypto.subtle.sign("HMAC", cryptoKey, new TextEncoder().encode(data));
-    return new Uint8Array(signature);
-}
-
-async function base64ToBytes(base64) {
-    const binaryString = atob(base64);
-    const bytes = new Uint8Array(binaryString.length);
-    for (let i = 0; i < binaryString.length; i++) {
-        bytes[i] = binaryString.charCodeAt(i);
-    }
-    return bytes;
-}
-
-async function bytesToBase64(bytes) {
-    return btoa(String.fromCharCode.apply(null, bytes));
-}
-
-function uuid() {
-    return crypto.randomUUID().replace(/-/g, "");
-}
-
-async function sign(urlStr) {
-    const url = urlStr.split("://")[1];
-    const encodedUrl = encodeURIComponent(url);
-    const uuidStr = uuid();
-    const formattedDate = dateFormat();
-    const bytesToSign = `MSTranslatorAndroidApp${encodedUrl}${formattedDate}${uuidStr}`.toLowerCase();
-    const decode = await base64ToBytes("oik6PdDdMnOXemTbwvMn9de/h9lFnfBaCWbGMMZqqoSaQaqUOqjVGm5NqsmjcBI1x+sS9ugjB55HEJWRiFXYFw==");
-    const signData = await hmacSha256(decode, bytesToSign);
-    const signBase64 = await bytesToBase64(signData);
-    return `MSTranslatorAndroidApp::${signBase64}::${formattedDate}::${uuidStr}`;
-}
-
-function dateFormat() {
-    const formattedDate = (new Date()).toUTCString().replace(/GMT/, "").trim() + " GMT";
-    return formattedDate.toLowerCase();
-}
-
-async function handleFileUpload(request) {
-    try {
-        const formData = await request.formData();
-        const file = formData.get('file');
-        const voice = formData.get('voice') || 'zh-CN-XiaoxiaoNeural';
-        const speed = formData.get('speed') || '1.0';
-        const volume = formData.get('volume') || '0';
-        const pitch = formData.get('pitch') || '0';
-        const style = formData.get('style') || 'general';
-
-        if (!file) {
-            return new Response(JSON.stringify({
-                error: { message: "未找到上传的文件", type: "invalid_request_error", param: "file", code: "missing_file" }
-            }), { status: 400, headers: { "Content-Type": "application/json", ...makeCORSHeaders() } });
-        }
-
-        if (!file.type.includes('text/') && !file.name.toLowerCase().endsWith('.txt')) {
-            return new Response(JSON.stringify({
-                error: { message: "不支持的文件类型，请上传txt文件", type: "invalid_request_error", param: "file", code: "invalid_file_type" }
-            }), { status: 400, headers: { "Content-Type": "application/json", ...makeCORSHeaders() } });
-        }
-
-        if (file.size > 500 * 1024) {
-            return new Response(JSON.stringify({
-                error: { message: "文件大小超过限制（最大500KB）", type: "invalid_request_error", param: "file", code: "file_too_large" }
-            }), { status: 400, headers: { "Content-Type": "application/json", ...makeCORSHeaders() } });
-        }
-
-        const text = await file.text();
-        
-        if (!text.trim()) {
-            return new Response(JSON.stringify({
-                error: { message: "文件内容为空", type: "invalid_request_error", param: "file", code: "empty_file" }
-            }), { status: 400, headers: { "Content-Type": "application/json", ...makeCORSHeaders() } });
-        }
-
-        if (text.length > 10000) {
-            return new Response(JSON.stringify({
-                error: { message: "文本内容过长（最大10000字符）", type: "invalid_request_error", param: "file", code: "text_too_long" }
-            }), { status: 400, headers: { "Content-Type": "application/json", ...makeCORSHeaders() } });
-        }
-
-        let rate = parseInt(String((parseFloat(speed) - 1.0) * 100));
-        let numVolume = parseInt(String(parseFloat(volume) * 100));
-        let numPitch = parseInt(pitch);
-
-        return await getVoice(
-            text,
-            voice,
-            rate >= 0 ? `+${rate}%` : `${rate}%`,
-            numPitch >= 0 ? `+${numPitch}Hz` : `${numPitch}Hz`,
-            numVolume >= 0 ? `+${numVolume}%` : `${numVolume}%`,
-            style,
-            "audio-24khz-48kbitrate-mono-mp3"
-        );
-
-    } catch (error) {
-        console.error("文件上传处理失败:", error);
-        return new Response(JSON.stringify({
-            error: { message: "文件处理失败", type: "api_error", param: null, code: "file_processing_error" }
-        }), { status: 500, headers: { "Content-Type": "application/json", ...makeCORSHeaders() } });
-    }
-}
-
-async function handleAudioTranscription(request) {
-    try {
-        if (request.method !== 'POST') {
-            return new Response(JSON.stringify({
-                error: { message: "只支持POST方法", type: "invalid_request_error", param: "method", code: "method_not_allowed" }
-            }), { status: 405, headers: { "Content-Type": "application/json", ...makeCORSHeaders() } });
-        }
-
-        const contentType = request.headers.get("content-type") || "";
-        
-        if (!contentType.includes("multipart/form-data")) {
-            return new Response(JSON.stringify({
-                error: { message: "请求必须使用multipart/form-data格式", type: "invalid_request_error", param: "content-type", code: "invalid_content_type" }
-            }), { status: 400, headers: { "Content-Type": "application/json", ...makeCORSHeaders() } });
-        }
-
-        const formData = await request.formData();
-        const audioFile = formData.get('file');
-        const customToken = formData.get('token');
-
-        if (!audioFile) {
-            return new Response(JSON.stringify({
-                error: { message: "未找到音频文件", type: "invalid_request_error", param: "file", code: "missing_file" }
-            }), { status: 400, headers: { "Content-Type": "application/json", ...makeCORSHeaders() } });
-        }
-
-        if (audioFile.size > 10 * 1024 * 1024) {
-            return new Response(JSON.stringify({
-                error: { message: "音频文件大小不能超过10MB", type: "invalid_request_error", param: "file", code: "file_too_large" }
-            }), { status: 400, headers: { "Content-Type": "application/json", ...makeCORSHeaders() } });
-        }
-
-        const allowedTypes = ['audio/mpeg','audio/mp3','audio/wav','audio/m4a','audio/flac','audio/aac','audio/ogg','audio/webm','audio/amr','audio/3gpp'];
-        const isValidType = allowedTypes.some(type => 
-            audioFile.type.includes(type) || 
-            audioFile.name.toLowerCase().match(/\.(mp3|wav|m4a|flac|aac|ogg|webm|amr|3gp)$/i)
-        );
-
-        if (!isValidType) {
-            return new Response(JSON.stringify({
-                error: { message: "不支持的音频文件格式", type: "invalid_request_error", param: "file", code: "invalid_file_type" }
-            }), { status: 400, headers: { "Content-Type": "application/json", ...makeCORSHeaders() } });
-        }
-
-        const token = customToken || 'sk-wtldsvuprmwltxpbspbmawtolbacghzawnjhtlzlnujjkfhh';
-
-        const apiFormData = new FormData();
-        apiFormData.append('file', audioFile);
-        apiFormData.append('model', 'FunAudioLLM/SenseVoiceSmall');
-
-        const apiResponse = await fetch('https://api.siliconflow.cn/v1/audio/transcriptions', {
-            method: 'POST',
-            headers: { 'Authorization': `Bearer ${token}` },
-            body: apiFormData
-        });
-
-        if (!apiResponse.ok) {
-            const errorText = await apiResponse.text();
-            console.error('硅基流动API错误:', apiResponse.status, errorText);
-            let errorMessage = '语音转录服务暂时不可用';
-            if (apiResponse.status === 401) errorMessage = 'API Token无效，请检查您的配置';
-            else if (apiResponse.status === 429) errorMessage = '请求过于频繁，请稍后再试';
-            else if (apiResponse.status === 413) errorMessage = '音频文件太大，请选择较小的文件';
-
-            return new Response(JSON.stringify({
-                error: { message: errorMessage, type: "api_error", param: null, code: "transcription_api_error" }
-            }), { status: apiResponse.status, headers: { "Content-Type": "application/json", ...makeCORSHeaders() } });
-        }
-
-        const transcriptionResult = await apiResponse.json();
-
-        return new Response(JSON.stringify(transcriptionResult), {
-            headers: { "Content-Type": "application/json", ...makeCORSHeaders() }
-        });
-
-    } catch (error) {
-        console.error("语音转录处理失败:", error);
-        return new Response(JSON.stringify({
-            error: { message: "语音转录处理失败", type: "api_error", param: null, code: "transcription_processing_error" }
-        }), { status: 500, headers: { "Content-Type": "application/json", ...makeCORSHeaders() } });
-    }
-}
-
-// ===================== 路由入口 =====================
-async function handleRequest(request) {
-    if (request.method === "OPTIONS") {
-        return handleOptions(request);
-    }
-
-    const requestUrl = new URL(request.url);
-    const path = requestUrl.pathname;
-
-    if (path === "/" || path === "/index.html") {
-        return new Response(HTML_PAGE, {
-            headers: {
-                "Content-Type": "text/html; charset=utf-8",
-                ...makeCORSHeaders()
-            }
-        });
-    }
-
-    if (path === "/v1/audio/transcriptions") {
-        try {
-            return await handleAudioTranscription(request);
-        } catch (error) {
-            console.error("Audio transcription error:", error);
-            return new Response(JSON.stringify({
-                error: { message: error.message, type: "api_error", param: null, code: "transcription_error" }
-            }), { status: 500, headers: { "Content-Type": "application/json", ...makeCORSHeaders() } });
-        }
-    }
-
-    if (path === "/v1/audio/speech-with-timings") {
-        try {
-            return await handleSpeechWithTimings(request);
-        } catch (error) {
-            console.error("Speech with timings error:", error);
-            return new Response(JSON.stringify({
-                error: { message: error.message || String(error), type: "api_error", param: null, code: "edge_tts_timings_error" }
-            }), { status: 500, headers: { "Content-Type": "application/json", ...makeCORSHeaders() } });
-        }
-    }
-
-    if (path === "/v1/audio/speech") {
-        try {
-            const contentType = request.headers.get("content-type") || "";
-            
-            if (contentType.includes("multipart/form-data")) {
-                return await handleFileUpload(request);
-            }
-            
-            const requestBody = await request.json();
-            const {
-                input,
-                voice = "zh-CN-XiaoxiaoNeural",
-                speed = '1.0',
-                volume = '0',
-                pitch = '0',
-                style = "general"
-            } = requestBody;
-
-            let rate = parseInt(String((parseFloat(speed) - 1.0) * 100));
-            let numVolume = parseInt(String(parseFloat(volume) * 100));
-            let numPitch = parseInt(pitch);
-            const response = await getVoice(
-                input,
-                voice,
-                rate >= 0 ? `+${rate}%` : `${rate}%`,
-                numPitch >= 0 ? `+${numPitch}Hz` : `${numPitch}Hz`,
-                numVolume >= 0 ? `+${numVolume}%` : `${numVolume}%`,
-                style,
-                "audio-24khz-48kbitrate-mono-mp3"
-            );
-
-            return response;
-
-        } catch (error) {
-            console.error("Error:", error);
-            return new Response(JSON.stringify({
-                error: { message: error.message, type: "api_error", param: null, code: "edge_tts_error" }
-            }), { status: 500, headers: { "Content-Type": "application/json", ...makeCORSHeaders() } });
-        }
-    }
-
-    return new Response("Not Found", { status: 404 });
-}
-
-export default {
-    async fetch(request, env, ctx) {
-        return handleRequest(request);
-    }
-};
-
-// ===================== HTML 页面（保持不变） =====================
+// HTML 页面模板
 const HTML_PAGE = `
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -967,104 +42,853 @@ const HTML_PAGE = `
             --radius-lg: 12px;
             --radius-xl: 16px;
         }
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background-color: var(--background-color); color: var(--text-primary); line-height: 1.6; min-height: 100vh; }
-        .container { max-width: 900px; margin: 0 auto; padding: 20px; }
-        .header { background: var(--surface-color); border-radius: var(--radius-xl); box-shadow: var(--shadow-lg); padding: 40px 30px; text-align: center; margin-bottom: 30px; border: 1px solid var(--border-color); }
-        .header h1 { font-size: 2.5rem; font-weight: 800; color: var(--primary-color); margin-bottom: 12px; letter-spacing: -0.025em; }
-        .header .subtitle { font-size: 1.125rem; color: var(--text-secondary); margin-bottom: 20px; font-weight: 500; }
-        .header .features { display: flex; justify-content: center; gap: 30px; flex-wrap: wrap; margin-top: 20px; }
-        .feature-item { display: flex; align-items: center; gap: 8px; color: var(--text-secondary); font-size: 0.875rem; font-weight: 500; }
-        .feature-icon { width: 20px; height: 20px; color: var(--success-color); }
-        .main-content { background: var(--surface-color); border-radius: var(--radius-xl); box-shadow: var(--shadow-lg); border: 1px solid var(--border-color); overflow: hidden; }
-        .form-container { padding: 40px; }
-        .form-group { margin-bottom: 24px; }
-        .form-label { display: block; margin-bottom: 8px; font-weight: 600; color: var(--text-primary); font-size: 0.875rem; }
-        .form-input, .form-select, .form-textarea { width: 100%; padding: 12px 16px; border: 2px solid var(--border-color); border-radius: var(--radius-md); font-size: 16px; color: var(--text-primary); background: var(--surface-color); transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1); }
-        .form-input:focus, .form-select:focus, .form-textarea:focus { outline: none; border-color: var(--border-focus); box-shadow: 0 0 0 3px rgb(59 130 246 / 0.1); }
-        .form-textarea { min-height: 120px; resize: vertical; font-family: inherit; }
-        .controls-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 20px; margin-bottom: 32px; }
-        .btn-primary { width: 100%; background: var(--primary-color); color: white; border: none; padding: 16px 32px; font-size: 16px; font-weight: 600; border-radius: var(--radius-md); cursor: pointer; transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1); display: flex; align-items: center; justify-content: center; gap: 8px; }
-        .btn-primary:hover:not(:disabled) { background: var(--primary-hover); transform: translateY(-1px); box-shadow: var(--shadow-md); }
-        .btn-primary:disabled { opacity: 0.6; cursor: not-allowed; transform: none; }
-        .btn-secondary { background: var(--success-color); color: white; border: none; padding: 12px 24px; border-radius: var(--radius-md); cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; gap: 8px; font-weight: 500; transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1); }
-        .btn-secondary:hover { background: #047857; transform: translateY(-1px); }
-        .result-container { margin-top: 32px; padding: 24px; background: var(--background-color); border-radius: var(--radius-lg); border: 1px solid var(--border-color); display: none; }
-        .audio-player { width: 100%; margin-bottom: 16px; border-radius: var(--radius-md); }
-        .error-message { color: var(--error-color); background: #fef2f2; border: 1px solid #fecaca; padding: 16px; border-radius: var(--radius-md); margin-top: 16px; font-weight: 500; }
-        .loading-container { text-align: center; padding: 32px 20px; }
-        .loading-spinner { width: 40px; height: 40px; border: 3px solid var(--border-color); border-top: 3px solid var(--primary-color); border-radius: 50%; animation: spin 1s linear infinite; margin: 0 auto 16px; }
-        .loading-text { color: var(--text-secondary); font-weight: 500; }
-        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
-        .input-method-tabs { display: flex; gap: 4px; margin-bottom: 20px; background: var(--background-color); padding: 4px; border-radius: var(--radius-lg); border: 1px solid var(--border-color); }
-        .tab-btn { flex: 1; display: flex; align-items: center; justify-content: center; gap: 10px; padding: 14px 20px; border: none; background: transparent; color: var(--text-secondary); border-radius: var(--radius-md); font-size: 0.9rem; font-weight: 500; cursor: pointer; transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1); position: relative; }
-        .tab-btn:hover { color: var(--primary-color); background: rgba(37, 99, 235, 0.05); }
-        .tab-btn.active { background: var(--primary-color); color: white; box-shadow: var(--shadow-sm); transform: translateY(-1px); }
-        .tab-btn .tab-icon { width: 20px; height: 20px; display: flex; align-items: center; justify-content: center; border-radius: 6px; background: rgba(255, 255, 255, 0.1); font-size: 0.875rem; }
-        .tab-btn:not(.active) .tab-icon { background: rgba(100, 116, 139, 0.1); }
-        .file-upload-container { width: 100%; }
-        .file-drop-zone { border: 2px dashed var(--border-color); border-radius: var(--radius-lg); padding: 48px 24px; text-align: center; cursor: pointer; transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1); background: linear-gradient(135deg, var(--background-color) 0%, rgba(248, 250, 252, 0.8) 100%); position: relative; overflow: hidden; }
-        .file-drop-zone::before { content: ''; position: absolute; top: 0; left: 0; right: 0; bottom: 0; background: linear-gradient(135deg, rgba(37, 99, 235, 0.05) 0%, rgba(99, 102, 241, 0.05) 100%); opacity: 0; transition: opacity 0.3s ease; }
-        .file-drop-zone:hover::before, .file-drop-zone.dragover::before { opacity: 1; }
-        .file-drop-zone:hover, .file-drop-zone.dragover { border-color: var(--primary-color); transform: translateY(-2px); box-shadow: 0 8px 25px rgba(37, 99, 235, 0.15); }
-        .file-drop-content { display: flex; flex-direction: column; align-items: center; gap: 12px; position: relative; z-index: 1; }
-        .file-drop-icon { width: 64px; height: 64px; display: flex; align-items: center; justify-content: center; background: linear-gradient(135deg, var(--primary-color) 0%, #3b82f6 100%); border-radius: var(--radius-lg); color: white; margin-bottom: 8px; box-shadow: var(--shadow-md); position: relative; }
-        .file-drop-text { font-size: 1.1rem; font-weight: 600; color: var(--text-primary); margin: 0; line-height: 1.4; }
-        .file-drop-hint { font-size: 0.875rem; color: var(--text-secondary); margin: 0; padding: 8px 16px; background: rgba(100, 116, 139, 0.1); border-radius: var(--radius-sm); }
-        .file-info { display: flex; align-items: center; justify-content: space-between; padding: 20px; background: linear-gradient(135deg, var(--surface-color) 0%, rgba(248, 250, 252, 0.5) 100%); border: 1px solid var(--border-color); border-radius: var(--radius-lg); margin-top: 16px; box-shadow: var(--shadow-sm); transition: all 0.2s ease; }
-        .file-info:hover { transform: translateY(-1px); box-shadow: var(--shadow-md); }
-        .file-details { display: flex; flex-direction: column; gap: 6px; flex: 1; }
-        .file-name { font-weight: 600; color: var(--text-primary); font-size: 0.95rem; display: flex; align-items: center; gap: 8px; }
-        .file-name::before { content: ''; width: 16px; height: 16px; background: var(--primary-color); border-radius: 3px; opacity: 0.8; flex-shrink: 0; }
-        .file-size { font-size: 0.8rem; color: var(--text-secondary); background: rgba(100, 116, 139, 0.1); padding: 2px 8px; border-radius: 4px; display: inline-block; width: fit-content; }
-        .file-remove-btn { width: 32px; height: 32px; border: none; background: var(--error-color); color: white; border-radius: var(--radius-md); cursor: pointer; display: flex; align-items: center; justify-content: center; font-size: 0.875rem; transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1); font-weight: 600; }
-        .file-remove-btn:hover { background: #b91c1c; transform: scale(1.05); box-shadow: 0 4px 12px rgba(220, 38, 38, 0.3); }
-        .mode-switcher { max-width: 900px; margin: 0 auto 30px; padding: 0 20px; display: flex; justify-content: center; gap: 20px; }
-        .mode-btn { display: flex; align-items: center; justify-content: center; gap: 12px; padding: 16px 32px; border: 2px solid var(--border-color); background: var(--surface-color); color: var(--text-secondary); border-radius: var(--radius-lg); font-size: 1rem; font-weight: 600; cursor: pointer; transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1); position: relative; flex: 1; max-width: 250px; }
-        .mode-btn:hover { border-color: var(--primary-color); color: var(--primary-color); transform: translateY(-2px); box-shadow: var(--shadow-lg); }
-        .mode-btn.active { background: var(--primary-color); color: white; border-color: var(--primary-color); transform: translateY(-2px); box-shadow: var(--shadow-lg); }
-        .mode-icon { width: 24px; height: 24px; display: flex; align-items: center; justify-content: center; }
-        .transcription-container { background: var(--surface-color); border-radius: var(--radius-xl); box-shadow: var(--shadow-lg); border: 1px solid var(--border-color); overflow: hidden; max-width: 900px; margin: 0 auto; }
-        .audio-upload-zone { border: 2px dashed var(--border-color); border-radius: var(--radius-lg); padding: 48px 24px; text-align: center; cursor: pointer; transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1); background: linear-gradient(135deg, var(--background-color) 0%, rgba(248, 250, 252, 0.8) 100%); position: relative; overflow: hidden; }
-        .audio-upload-zone::before { content: ''; position: absolute; top: 0; left: 0; right: 0; bottom: 0; background: linear-gradient(135deg, rgba(37, 99, 235, 0.05) 0%, rgba(99, 102, 241, 0.05) 100%); opacity: 0; transition: opacity 0.3s ease; }
-        .audio-upload-zone:hover::before, .audio-upload-zone.dragover::before { opacity: 1; }
-        .audio-upload-zone:hover, .audio-upload-zone.dragover { border-color: var(--primary-color); transform: translateY(-2px); box-shadow: 0 8px 25px rgba(37, 99, 235, 0.15); }
-        .token-config { display: flex; gap: 20px; margin-bottom: 16px; }
-        .token-option { display: flex; align-items: center; }
-        .token-label { display: flex; align-items: center; gap: 8px; cursor: pointer; font-weight: 500; color: var(--text-secondary); transition: color 0.2s ease; }
-        .token-label:hover { color: var(--text-primary); }
-        .token-label input[type="radio"] { width: 16px; height: 16px; border-radius: 50%; border: 2px solid var(--border-color); margin: 0; cursor: pointer; accent-color: var(--primary-color); }
-        .transcription-result { margin-top: 20px; }
-        .result-actions { display: flex; gap: 12px; margin-top: 16px; flex-wrap: wrap; }
-        .result-actions .btn-secondary { flex: 1; min-width: 140px; }
-        .language-switcher { position: fixed; top: 20px; right: 20px; z-index: 1000; }
-        .language-btn { display: flex; align-items: center; gap: 8px; padding: 8px 12px; background: var(--surface-color); border: 1px solid var(--border-color); border-radius: var(--radius-md); cursor: pointer; font-size: 0.875rem; font-weight: 500; color: var(--text-secondary); transition: all 0.2s ease; box-shadow: var(--shadow-sm); }
-        .language-btn:hover { color: var(--primary-color); border-color: var(--primary-color); box-shadow: var(--shadow-md); }
-        .language-dropdown { position: absolute; top: 100%; right: 0; margin-top: 4px; background: var(--surface-color); border: 1px solid var(--border-color); border-radius: var(--radius-md); box-shadow: var(--shadow-lg); min-width: 120px; display: none; }
-        .language-dropdown.show { display: block; }
-        .language-option { display: flex; align-items: center; gap: 8px; padding: 8px 12px; cursor: pointer; font-size: 0.875rem; color: var(--text-secondary); transition: background-color 0.2s ease; }
-        .language-option:hover { background: var(--background-color); color: var(--text-primary); }
-        .language-option.active { background: var(--primary-color); color: white; }
+        
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background-color: var(--background-color);
+            color: var(--text-primary);
+            line-height: 1.6;
+            min-height: 100vh;
+        }
+        
+        .container {
+            max-width: 900px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        
+        .header {
+            background: var(--surface-color);
+            border-radius: var(--radius-xl);
+            box-shadow: var(--shadow-lg);
+            padding: 40px 30px;
+            text-align: center;
+            margin-bottom: 30px;
+            border: 1px solid var(--border-color);
+        }
+        
+        .header h1 {
+            font-size: 2.5rem;
+            font-weight: 800;
+            color: var(--primary-color);
+            margin-bottom: 12px;
+            letter-spacing: -0.025em;
+        }
+        
+        .header .subtitle {
+            font-size: 1.125rem;
+            color: var(--text-secondary);
+            margin-bottom: 20px;
+            font-weight: 500;
+        }
+        
+        .header .features {
+            display: flex;
+            justify-content: center;
+            gap: 30px;
+            flex-wrap: wrap;
+            margin-top: 20px;
+        }
+        
+        .feature-item {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            color: var(--text-secondary);
+            font-size: 0.875rem;
+            font-weight: 500;
+        }
+        
+        .feature-icon {
+            width: 20px;
+            height: 20px;
+            color: var(--success-color);
+        }
+        
+        .main-content {
+            background: var(--surface-color);
+            border-radius: var(--radius-xl);
+            box-shadow: var(--shadow-lg);
+            border: 1px solid var(--border-color);
+            overflow: hidden;
+        }
+        
+        .form-container {
+            padding: 40px;
+        }
+        
+        .form-group {
+            margin-bottom: 24px;
+        }
+        
+        .form-label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 600;
+            color: var(--text-primary);
+            font-size: 0.875rem;
+        }
+        
+        .form-input, .form-select, .form-textarea {
+            width: 100%;
+            padding: 12px 16px;
+            border: 2px solid var(--border-color);
+            border-radius: var(--radius-md);
+            font-size: 16px;
+            color: var(--text-primary);
+            background: var(--surface-color);
+            transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+        
+        .form-input:focus, .form-select:focus, .form-textarea:focus {
+            outline: none;
+            border-color: var(--border-focus);
+            box-shadow: 0 0 0 3px rgb(59 130 246 / 0.1);
+        }
+        
+        .form-textarea {
+            min-height: 120px;
+            resize: vertical;
+            font-family: inherit;
+        }
+        
+        .controls-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 20px;
+            margin-bottom: 32px;
+        }
+        
+        .btn-primary {
+            width: 100%;
+            background: var(--primary-color);
+            color: white;
+            border: none;
+            padding: 16px 32px;
+            font-size: 16px;
+            font-weight: 600;
+            border-radius: var(--radius-md);
+            cursor: pointer;
+            transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+        }
+        
+        .btn-primary:hover:not(:disabled) {
+            background: var(--primary-hover);
+            transform: translateY(-1px);
+            box-shadow: var(--shadow-md);
+        }
+        
+        .btn-primary:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+            transform: none;
+        }
+        
+        .btn-secondary {
+            background: var(--success-color);
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: var(--radius-md);
+            cursor: pointer;
+            text-decoration: none;
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            font-weight: 500;
+            transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+        }
+        
+        .btn-secondary:hover {
+            background: #047857;
+            transform: translateY(-1px);
+        }
+        
+        .result-container {
+            margin-top: 32px;
+            padding: 24px;
+            background: var(--background-color);
+            border-radius: var(--radius-lg);
+            border: 1px solid var(--border-color);
+            display: none;
+        }
+        
+        .audio-player {
+            width: 100%;
+            margin-bottom: 16px;
+            border-radius: var(--radius-md);
+        }
+        
+        .error-message {
+            color: var(--error-color);
+            background: #fef2f2;
+            border: 1px solid #fecaca;
+            padding: 16px;
+            border-radius: var(--radius-md);
+            margin-top: 16px;
+            font-weight: 500;
+        }
+        
+        .loading-container {
+            text-align: center;
+            padding: 32px 20px;
+        }
+        
+        .loading-spinner {
+            width: 40px;
+            height: 40px;
+            border: 3px solid var(--border-color);
+            border-top: 3px solid var(--primary-color);
+            border-radius: 50%;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 16px;
+        }
+        
+        .loading-text {
+            color: var(--text-secondary);
+            font-weight: 500;
+        }
+        
+        .wechat-promotion {
+            margin-top: 40px;
+            background: var(--surface-color);
+            border-radius: var(--radius-xl);
+            box-shadow: var(--shadow-md);
+            border: 1px solid var(--border-color);
+            overflow: hidden;
+        }
+        
+        .promotion-header {
+            background: #f1f5f9;
+            padding: 20px 30px;
+            border-bottom: 1px solid var(--border-color);
+        }
+        
+        .promotion-title {
+            font-size: 1.25rem;
+            font-weight: 700;
+            color: var(--text-primary);
+            margin-bottom: 8px;
+        }
+        
+        .promotion-subtitle {
+            color: var(--text-secondary);
+            font-size: 0.875rem;
+        }
+        
+        .promotion-content {
+            padding: 30px;
+            display: grid;
+            grid-template-columns: auto 1fr;
+            gap: 24px;
+            align-items: center;
+        }
+        
+        .qr-code {
+            width: 120px;
+            height: 120px;
+            border: 2px solid var(--border-color);
+            border-radius: var(--radius-lg);
+            overflow: hidden;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        
+        .qr-code img {
+            width: 100%;
+            height: 100%;
+            object-fit: cover;
+        }
+        
+        .promotion-info h3 {
+            font-size: 1.125rem;
+            font-weight: 600;
+            color: var(--text-primary);
+            margin-bottom: 12px;
+        }
+        
+        .promotion-info p {
+            color: var(--text-secondary);
+            margin-bottom: 16px;
+            line-height: 1.6;
+        }
+        
+        .benefits-list {
+            list-style: none;
+            padding: 0;
+            margin: 0;
+        }
+        
+        .benefits-list li {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            color: var(--text-secondary);
+            font-size: 0.875rem;
+            margin-bottom: 8px;
+        }
+        
+        .benefits-list li:before {
+            content: "✓";
+            color: var(--success-color);
+            font-weight: bold;
+            font-size: 1rem;
+        }
+        
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        
+        @keyframes fadeIn {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        
+        .fade-in {
+            animation: fadeIn 0.3s ease-out;
+        }
+        
+        .input-method-tabs {
+            display: flex;
+            gap: 4px;
+            margin-bottom: 20px;
+            background: var(--background-color);
+            padding: 4px;
+            border-radius: var(--radius-lg);
+            border: 1px solid var(--border-color);
+        }
+        
+        .tab-btn {
+            flex: 1;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 10px;
+            padding: 14px 20px;
+            border: none;
+            background: transparent;
+            color: var(--text-secondary);
+            border-radius: var(--radius-md);
+            font-size: 0.9rem;
+            font-weight: 500;
+            cursor: pointer;
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            position: relative;
+        }
+        
+        .tab-btn:hover {
+            color: var(--primary-color);
+            background: rgba(37, 99, 235, 0.05);
+        }
+        
+        .tab-btn.active {
+            background: var(--primary-color);
+            color: white;
+            box-shadow: var(--shadow-sm);
+            transform: translateY(-1px);
+        }
+        
+        .tab-btn .tab-icon {
+            width: 20px;
+            height: 20px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border-radius: 6px;
+            background: rgba(255, 255, 255, 0.1);
+            font-size: 0.875rem;
+        }
+        
+        .tab-btn:not(.active) .tab-icon {
+            background: rgba(100, 116, 139, 0.1);
+        }
+        
+        .file-upload-container {
+            width: 100%;
+        }
+        
+        .file-drop-zone {
+            border: 2px dashed var(--border-color);
+            border-radius: var(--radius-lg);
+            padding: 48px 24px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            background: linear-gradient(135deg, var(--background-color) 0%, rgba(248, 250, 252, 0.8) 100%);
+            position: relative;
+            overflow: hidden;
+        }
+        
+        .file-drop-zone::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: linear-gradient(135deg, rgba(37, 99, 235, 0.05) 0%, rgba(99, 102, 241, 0.05) 100%);
+            opacity: 0;
+            transition: opacity 0.3s ease;
+        }
+        
+        .file-drop-zone:hover::before,
+        .file-drop-zone.dragover::before {
+            opacity: 1;
+        }
+        
+        .file-drop-zone:hover,
+        .file-drop-zone.dragover {
+            border-color: var(--primary-color);
+            transform: translateY(-2px);
+            box-shadow: 0 8px 25px rgba(37, 99, 235, 0.15);
+        }
+        
+        .file-drop-content {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 12px;
+            position: relative;
+            z-index: 1;
+        }
+        
+        .file-drop-icon {
+            width: 64px;
+            height: 64px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: linear-gradient(135deg, var(--primary-color) 0%, #3b82f6 100%);
+            border-radius: var(--radius-lg);
+            color: white;
+            margin-bottom: 8px;
+            box-shadow: var(--shadow-md);
+            position: relative;
+        }
+        
+        .file-drop-text {
+            font-size: 1.1rem;
+            font-weight: 600;
+            color: var(--text-primary);
+            margin: 0;
+            line-height: 1.4;
+        }
+        
+        .file-drop-hint {
+            font-size: 0.875rem;
+            color: var(--text-secondary);
+            margin: 0;
+            padding: 8px 16px;
+            background: rgba(100, 116, 139, 0.1);
+            border-radius: var(--radius-sm);
+        }
+        
+        .file-info {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 20px;
+            background: linear-gradient(135deg, var(--surface-color) 0%, rgba(248, 250, 252, 0.5) 100%);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius-lg);
+            margin-top: 16px;
+            box-shadow: var(--shadow-sm);
+            transition: all 0.2s ease;
+        }
+        
+        .file-info:hover {
+            transform: translateY(-1px);
+            box-shadow: var(--shadow-md);
+        }
+        
+        .file-details {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            flex: 1;
+        }
+        
+        .file-name {
+            font-weight: 600;
+            color: var(--text-primary);
+            font-size: 0.95rem;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+        
+        .file-name::before {
+            content: '';
+            width: 16px;
+            height: 16px;
+            background: var(--primary-color);
+            border-radius: 3px;
+            opacity: 0.8;
+            flex-shrink: 0;
+        }
+        
+        .file-size {
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+            background: rgba(100, 116, 139, 0.1);
+            padding: 2px 8px;
+            border-radius: 4px;
+            display: inline-block;
+            width: fit-content;
+        }
+        
+        .file-remove-btn {
+            width: 32px;
+            height: 32px;
+            border: none;
+            background: var(--error-color);
+            color: white;
+            border-radius: var(--radius-md);
+            cursor: pointer;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 0.875rem;
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            font-weight: 600;
+        }
+        
+        .file-remove-btn:hover {
+            background: #b91c1c;
+            transform: scale(1.05);
+            box-shadow: 0 4px 12px rgba(220, 38, 38, 0.3);
+        }
+        
+        .mode-switcher {
+            max-width: 900px;
+            margin: 0 auto 30px;
+            padding: 0 20px;
+            display: flex;
+            justify-content: center;
+            gap: 20px;
+        }
+        
+        .mode-btn {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 12px;
+            padding: 16px 32px;
+            border: 2px solid var(--border-color);
+            background: var(--surface-color);
+            color: var(--text-secondary);
+            border-radius: var(--radius-lg);
+            font-size: 1rem;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            position: relative;
+            flex: 1;
+            max-width: 250px;
+        }
+        
+        .mode-btn:hover {
+            border-color: var(--primary-color);
+            color: var(--primary-color);
+            transform: translateY(-2px);
+            box-shadow: var(--shadow-lg);
+        }
+        
+        .mode-btn.active {
+            background: var(--primary-color);
+            color: white;
+            border-color: var(--primary-color);
+            transform: translateY(-2px);
+            box-shadow: var(--shadow-lg);
+        }
+        
+        .mode-icon {
+            width: 24px;
+            height: 24px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+        
+        .transcription-container {
+            background: var(--surface-color);
+            border-radius: var(--radius-xl);
+            box-shadow: var(--shadow-lg);
+            border: 1px solid var(--border-color);
+            overflow: hidden;
+            max-width: 900px;
+            margin: 0 auto;
+        }
+        
+        .audio-upload-zone {
+            border: 2px dashed var(--border-color);
+            border-radius: var(--radius-lg);
+            padding: 48px 24px;
+            text-align: center;
+            cursor: pointer;
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            background: linear-gradient(135deg, var(--background-color) 0%, rgba(248, 250, 252, 0.8) 100%);
+            position: relative;
+            overflow: hidden;
+        }
+        
+        .audio-upload-zone::before {
+            content: '';
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: linear-gradient(135deg, rgba(37, 99, 235, 0.05) 0%, rgba(99, 102, 241, 0.05) 100%);
+            opacity: 0;
+            transition: opacity 0.3s ease;
+        }
+        
+        .audio-upload-zone:hover::before,
+        .audio-upload-zone.dragover::before {
+            opacity: 1;
+        }
+        
+        .audio-upload-zone:hover,
+        .audio-upload-zone.dragover {
+            border-color: var(--primary-color);
+            transform: translateY(-2px);
+            box-shadow: 0 8px 25px rgba(37, 99, 235, 0.15);
+        }
+        
+        .token-config {
+            display: flex;
+            gap: 20px;
+            margin-bottom: 16px;
+        }
+        
+        .token-option {
+            display: flex;
+            align-items: center;
+        }
+        
+        .token-label {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            cursor: pointer;
+            font-weight: 500;
+            color: var(--text-secondary);
+            transition: color 0.2s ease;
+        }
+        
+        .token-label:hover {
+            color: var(--text-primary);
+        }
+        
+        .token-label input[type="radio"] {
+            width: 16px;
+            height: 16px;
+            border-radius: 50%;
+            border: 2px solid var(--border-color);
+            margin: 0;
+            cursor: pointer;
+            accent-color: var(--primary-color);
+        }
+        
+        .transcription-result {
+            margin-top: 20px;
+        }
+        
+        .result-actions {
+            display: flex;
+            gap: 12px;
+            margin-top: 16px;
+            flex-wrap: wrap;
+        }
+        
+        .result-actions .btn-secondary {
+            flex: 1;
+            min-width: 140px;
+        }
+        
+        .language-switcher {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            z-index: 1000;
+        }
+        
+        .language-btn {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 12px;
+            background: var(--surface-color);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius-md);
+            cursor: pointer;
+            font-size: 0.875rem;
+            font-weight: 500;
+            color: var(--text-secondary);
+            transition: all 0.2s ease;
+            box-shadow: var(--shadow-sm);
+        }
+        
+        .language-btn:hover {
+            color: var(--primary-color);
+            border-color: var(--primary-color);
+            box-shadow: var(--shadow-md);
+        }
+        
+        .language-dropdown {
+            position: absolute;
+            top: 100%;
+            right: 0;
+            margin-top: 4px;
+            background: var(--surface-color);
+            border: 1px solid var(--border-color);
+            border-radius: var(--radius-md);
+            box-shadow: var(--shadow-lg);
+            min-width: 120px;
+            display: none;
+        }
+        
+        .language-dropdown.show {
+            display: block;
+        }
+        
+        .language-option {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 12px;
+            cursor: pointer;
+            font-size: 0.875rem;
+            color: var(--text-secondary);
+            transition: background-color 0.2s ease;
+        }
+        
+        .language-option:hover {
+            background: var(--background-color);
+            color: var(--text-primary);
+        }
+        
+        .language-option.active {
+            background: var(--primary-color);
+            color: white;
+        }
+        
         @media (max-width: 768px) {
-            .container { padding: 16px; }
-            .header { padding: 30px 20px; }
-            .header h1 { font-size: 2rem; }
-            .form-container { padding: 24px; }
-            .controls-grid { grid-template-columns: 1fr; gap: 16px; }
-            .input-method-tabs { gap: 2px; padding: 2px; }
-            .tab-btn { padding: 12px 16px; font-size: 0.85rem; gap: 8px; }
-            .tab-btn .tab-icon { width: 18px; height: 18px; }
-            .file-drop-zone { padding: 32px 16px; }
-            .file-drop-icon { width: 56px; height: 56px; }
-            .file-info { padding: 16px; flex-direction: column; gap: 12px; align-items: flex-start; }
-            .file-remove-btn { align-self: flex-end; }
-            .mode-switcher { padding: 0 16px; margin-bottom: 20px; flex-direction: column; gap: 12px; }
-            .mode-btn { max-width: none; padding: 14px 20px; font-size: 0.9rem; gap: 8px; }
-            .mode-icon { width: 20px; height: 20px; }
-            .audio-upload-zone { padding: 32px 16px; }
-            .token-config { flex-direction: column; gap: 12px; }
-            .result-actions { flex-direction: column; }
-            .result-actions .btn-secondary { min-width: auto; }
+            .container {
+                padding: 16px;
+            }
+            
+            .header {
+                padding: 30px 20px;
+            }
+            
+            .header h1 {
+                font-size: 2rem;
+            }
+            
+            .form-container {
+                padding: 24px;
+            }
+            
+            .controls-grid {
+                grid-template-columns: 1fr;
+                gap: 16px;
+            }
+            
+            .promotion-content {
+                grid-template-columns: 1fr;
+                text-align: center;
+                gap: 20px;
+            }
+            
+            .qr-code {
+                margin: 0 auto;
+            }
+            
+            .input-method-tabs {
+                gap: 2px;
+                padding: 2px;
+            }
+            
+            .tab-btn {
+                padding: 12px 16px;
+                font-size: 0.85rem;
+                gap: 8px;
+            }
+            
+            .tab-btn .tab-icon {
+                width: 18px;
+                height: 18px;
+            }
+            
+            .file-drop-zone {
+                padding: 32px 16px;
+            }
+            
+            .file-drop-icon {
+                width: 56px;
+                height: 56px;
+            }
+            
+            .file-info {
+                padding: 16px;
+                flex-direction: column;
+                gap: 12px;
+                align-items: flex-start;
+            }
+            
+            .file-remove-btn {
+                align-self: flex-end;
+            }
+            
+            .mode-switcher {
+                padding: 0 16px;
+                margin-bottom: 20px;
+                flex-direction: column;
+                gap: 12px;
+            }
+            
+            .mode-btn {
+                max-width: none;
+                padding: 14px 20px;
+                font-size: 0.9rem;
+                gap: 8px;
+            }
+            
+            .mode-icon {
+                width: 20px;
+                height: 20px;
+            }
+            
+            .audio-upload-zone {
+                padding: 32px 16px;
+            }
+            
+            .token-config {
+                flex-direction: column;
+                gap: 12px;
+            }
+            
+            .result-actions {
+                flex-direction: column;
+            }
+            
+            .result-actions .btn-secondary {
+                min-width: auto;
+            }
         }
     </style>
 </head>
@@ -1328,6 +1152,28 @@ const HTML_PAGE = `
                 </div>
             </div>
         </div>
+        
+        <div class="wechat-promotion" id="wechatPromotion" style="display: none;">
+            <div class="promotion-header">
+                <h2 class="promotion-title">🎉 生成成功！喜欢这个工具吗？</h2>
+                <p class="promotion-subtitle">关注我们获取更多AI工具和技术分享</p>
+            </div>
+            <div class="promotion-content">
+                <div class="qr-code">
+                    <img src="https://img.996007.icu/file/img1/a48c4eac2f2a99909da5611c3885726.jpg" alt="微信公众号二维码" />
+                </div>
+                <div class="promotion-info">
+                    <h3>关注「一只会飞的旺旺」公众号</h3>
+                    <p>获取更多实用的AI工具、技术教程和独家资源分享</p>
+                    <ul class="benefits-list">
+                        <li>最新AI工具推荐和使用教程</li>
+                        <li>前沿技术解析和实战案例</li>
+                        <li>独家资源和工具源码分享</li>
+                        <li>技术问题答疑和交流社群</li>
+                    </ul>
+                </div>
+            </div>
+        </div>
     </div>
 
     <script>
@@ -1335,6 +1181,7 @@ const HTML_PAGE = `
         let currentInputMethod = 'text';
         let currentMode = 'tts';
         let selectedAudioFile = null;
+        let transcriptionToken = null;
         let currentLanguage = 'en';
 
         const translations = {
@@ -1590,10 +1437,8 @@ const HTML_PAGE = `
                 success.style.display = 'block';
                 setTimeout(() => {
                     const wechatPromotion = document.getElementById('wechatPromotion');
-                    if (wechatPromotion) {
-                        wechatPromotion.style.display = 'block';
-                        wechatPromotion.classList.add('fade-in');
-                    }
+                    wechatPromotion.style.display = 'block';
+                    wechatPromotion.classList.add('fade-in');
                 }, 1000);
             } catch (err) {
                 loading.style.display = 'none';
@@ -1625,6 +1470,7 @@ const HTML_PAGE = `
             const transcriptionMode = document.getElementById('transcriptionMode');
             const mainContent = document.querySelector('.main-content');
             const transcriptionContainer = document.getElementById('transcriptionContainer');
+            const wechatPromotion = document.getElementById('wechatPromotion');
             currentMode = mode;
             if (mode === 'tts') {
                 ttsMode.classList.add('active');
@@ -1637,6 +1483,7 @@ const HTML_PAGE = `
                 mainContent.style.display = 'none';
                 transcriptionContainer.style.display = 'block';
             }
+            wechatPromotion.style.display = 'none';
         }
 
         function initializeAudioUpload() {
@@ -1737,10 +1584,8 @@ const HTML_PAGE = `
                 transcriptionSuccess.style.display = 'block';
                 setTimeout(() => {
                     const wechatPromotion = document.getElementById('wechatPromotion');
-                    if (wechatPromotion) {
-                        wechatPromotion.style.display = 'block';
-                        wechatPromotion.classList.add('fade-in');
-                    }
+                    wechatPromotion.style.display = 'block';
+                    wechatPromotion.classList.add('fade-in');
                 }, 1000);
             } catch (err) {
                 transcriptionLoading.style.display = 'none';
@@ -1812,3 +1657,954 @@ const HTML_PAGE = `
 </body>
 </html>
 `;
+
+export default {
+    async fetch(request, env, ctx) {
+        return handleRequest(request);
+    }
+};
+
+async function handleRequest(request) {
+    if (request.method === "OPTIONS") {
+        return handleOptions(request);
+    }
+
+    const requestUrl = new URL(request.url);
+    const path = requestUrl.pathname;
+
+    // 返回前端页面
+    if (path === "/" || path === "/index.html") {
+        return new Response(HTML_PAGE, {
+            headers: {
+                "Content-Type": "text/html; charset=utf-8",
+                ...makeCORSHeaders()
+            }
+        });
+    }
+
+    if (path === "/v1/audio/transcriptions") {
+        try {
+            return await handleAudioTranscription(request);
+        } catch (error) {
+            console.error("Audio transcription error:", error);
+            return new Response(JSON.stringify({
+                error: {
+                    message: error.message,
+                    type: "api_error",
+                    param: null,
+                    code: "transcription_error"
+                }
+            }), {
+                status: 500,
+                headers: {
+                    "Content-Type": "application/json",
+                    ...makeCORSHeaders()
+                }
+            });
+        }
+    }
+
+    // ★ 返回音频 + WordBoundary 时间戳的端点（用于精确朗读高亮）
+    if (path === "/v1/audio/speech-with-timings") {
+        try {
+            return await handleSpeechWithTimings(request);
+        } catch (error) {
+            console.error("Speech with timings error:", error);
+            return new Response(JSON.stringify({
+                error: {
+                    message: error.message || String(error),
+                    type: "api_error",
+                    param: null,
+                    code: "edge_tts_timings_error"
+                }
+            }), {
+                status: 500,
+                headers: {
+                    "Content-Type": "application/json",
+                    ...makeCORSHeaders()
+                }
+            });
+        }
+    }
+
+    if (path === "/v1/audio/speech") {
+        try {
+            const contentType = request.headers.get("content-type") || "";
+            
+            if (contentType.includes("multipart/form-data")) {
+                return await handleFileUpload(request);
+            }
+            
+            const requestBody = await request.json();
+            const {
+                input,
+                voice = "zh-CN-XiaoxiaoNeural",
+                speed = '1.0',
+                volume = '0',
+                pitch = '0',
+                style = "general"
+            } = requestBody;
+
+            let rate = parseInt(String((parseFloat(speed) - 1.0) * 100));
+            let numVolume = parseInt(String(parseFloat(volume) * 100));
+            let numPitch = parseInt(pitch);
+            const response = await getVoice(
+                input,
+                voice,
+                rate >= 0 ? `+${rate}%` : `${rate}%`,
+                numPitch >= 0 ? `+${numPitch}Hz` : `${numPitch}Hz`,
+                numVolume >= 0 ? `+${numVolume}%` : `${numVolume}%`,
+                style,
+                "audio-24khz-48kbitrate-mono-mp3"
+            );
+
+            return response;
+
+        } catch (error) {
+            console.error("Error:", error);
+            return new Response(JSON.stringify({
+                error: {
+                    message: error.message,
+                    type: "api_error",
+                    param: null,
+                    code: "edge_tts_error"
+                }
+            }), {
+                status: 500,
+                headers: {
+                    "Content-Type": "application/json",
+                    ...makeCORSHeaders()
+                }
+            });
+        }
+    }
+
+    return new Response("Not Found", { status: 404 });
+}
+
+async function handleOptions(request) {
+    return new Response(null, {
+        status: 204,
+        headers: {
+            ...makeCORSHeaders(),
+            "Access-Control-Allow-Methods": "GET,HEAD,POST,OPTIONS",
+            "Access-Control-Allow-Headers": request.headers.get("Access-Control-Request-Headers") || "Authorization"
+        }
+    });
+}
+
+function delay(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function optimizedTextSplit(text, maxChunkSize = 1500) {
+    const chunks = [];
+    const sentences = text.split(/[。！？\n]/);
+    let currentChunk = '';
+    
+    for (const sentence of sentences) {
+        const trimmedSentence = sentence.trim();
+        if (!trimmedSentence) continue;
+        
+        if (trimmedSentence.length > maxChunkSize) {
+            if (currentChunk) {
+                chunks.push(currentChunk.trim());
+                currentChunk = '';
+            }
+            for (let i = 0; i < trimmedSentence.length; i += maxChunkSize) {
+                chunks.push(trimmedSentence.slice(i, i + maxChunkSize));
+            }
+        } else if ((currentChunk + trimmedSentence).length > maxChunkSize) {
+            if (currentChunk) chunks.push(currentChunk.trim());
+            currentChunk = trimmedSentence;
+        } else {
+            currentChunk += (currentChunk ? '。' : '') + trimmedSentence;
+        }
+    }
+    
+    if (currentChunk.trim()) chunks.push(currentChunk.trim());
+    return chunks.filter(chunk => chunk.length > 0);
+}
+
+async function processBatchedAudioChunks(chunks, voiceName, rate, pitch, volume, style, outputFormat, batchSize = 3, delayMs = 1000) {
+    const audioChunks = [];
+    
+    for (let i = 0; i < chunks.length; i += batchSize) {
+        const batch = chunks.slice(i, i + batchSize);
+        const batchPromises = batch.map(async (chunk, index) => {
+            try {
+                if (index > 0) await delay(index * 200);
+                return await getAudioChunk(chunk, voiceName, rate, pitch, volume, style, outputFormat);
+            } catch (error) {
+                console.error(`处理音频块失败 (批次 ${Math.floor(i/batchSize) + 1}, 块 ${index + 1}):`, error);
+                throw error;
+            }
+        });
+        
+        try {
+            const batchResults = await Promise.all(batchPromises);
+            audioChunks.push(...batchResults);
+            if (i + batchSize < chunks.length) await delay(delayMs);
+        } catch (error) {
+            console.error(`批次处理失败:`, error);
+            throw error;
+        }
+    }
+    
+    return audioChunks;
+}
+
+async function getVoice(text, voiceName = "zh-CN-XiaoxiaoNeural", rate = '+0%', pitch = '+0Hz', volume = '+0%', style = "general", outputFormat = "audio-24khz-48kbitrate-mono-mp3") {
+    try {
+        const cleanText = text.trim();
+        if (!cleanText) throw new Error("文本内容为空");
+        
+        if (cleanText.length <= 1500) {
+            const audioBlob = await getAudioChunk(cleanText, voiceName, rate, pitch, volume, style, outputFormat);
+            return new Response(audioBlob, {
+                headers: { "Content-Type": "audio/mpeg", ...makeCORSHeaders() }
+            });
+        }
+
+        const chunks = optimizedTextSplit(cleanText, 1500);
+        
+        if (chunks.length > 40) {
+            throw new Error(`文本过长，分块数量(${chunks.length})超过限制。请缩短文本或分批处理。`);
+        }
+        
+        console.log(`文本已分为 ${chunks.length} 个块进行处理`);
+
+        const audioChunks = await processBatchedAudioChunks(
+            chunks, voiceName, rate, pitch, volume, style, outputFormat, 3, 800
+        );
+
+        const concatenatedAudio = new Blob(audioChunks, { type: 'audio/mpeg' });
+        return new Response(concatenatedAudio, {
+            headers: { "Content-Type": "audio/mpeg", ...makeCORSHeaders() }
+        });
+
+    } catch (error) {
+        console.error("语音合成失败:", error);
+        return new Response(JSON.stringify({
+            error: {
+                message: error.message || String(error),
+                type: "api_error",
+                param: `${voiceName}, ${rate}, ${pitch}, ${volume}, ${style}, ${outputFormat}`,
+                code: "edge_tts_error"
+            }
+        }), {
+            status: 500,
+            headers: { "Content-Type": "application/json", ...makeCORSHeaders() }
+        });
+    }
+}
+
+async function getAudioChunk(text, voiceName, rate, pitch, volume, style, outputFormat = 'audio-24khz-48kbitrate-mono-mp3', maxRetries = 3) {
+    const retryDelay = 500;
+    
+    for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        try {
+            const endpoint = await getEndpoint();
+            const url = `https://${endpoint.r}.tts.speech.microsoft.com/cognitiveservices/v1`;
+            
+            let m = text.match(/\[(\d+)\]\s*?$/);
+            let slien = 0;
+            if (m && m.length == 2) {
+                slien = parseInt(m[1]);
+                text = text.replace(m[0], '');
+            }
+            
+            if (!text.trim()) throw new Error("文本块为空");
+            if (text.length > 2000) throw new Error(`文本块过长: ${text.length} 字符，最大支持2000字符`);
+            
+            const response = await fetch(url, {
+                method: "POST",
+                headers: {
+                    "Authorization": endpoint.t,
+                    "Content-Type": "application/ssml+xml",
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36 Edg/127.0.0.0",
+                    "X-Microsoft-OutputFormat": outputFormat
+                },
+                body: getSsml(text, voiceName, rate, pitch, volume, style, slien)
+            });
+
+            if (!response.ok) {
+                const errorText = await response.text();
+                
+                if (response.status === 429) {
+                    if (attempt < maxRetries) {
+                        console.log(`频率限制，第${attempt + 1}次重试，等待${retryDelay * (attempt + 1)}ms`);
+                        await delay(retryDelay * (attempt + 1));
+                        continue;
+                    }
+                    throw new Error(`请求频率过高，已重试${maxRetries}次仍失败`);
+                } else if (response.status >= 500) {
+                    if (attempt < maxRetries) {
+                        console.log(`服务器错误，第${attempt + 1}次重试，等待${retryDelay * (attempt + 1)}ms`);
+                        await delay(retryDelay * (attempt + 1));
+                        continue;
+                    }
+                    throw new Error(`Edge TTS服务器错误: ${response.status} ${errorText}`);
+                } else {
+                    throw new Error(`Edge TTS API错误: ${response.status} ${errorText}`);
+                }
+            }
+
+            return await response.blob();
+            
+        } catch (error) {
+            if (attempt === maxRetries) {
+                throw new Error(`音频生成失败（已重试${maxRetries}次）: ${error.message}`);
+            }
+            if (error.message.includes('fetch') || error.message.includes('network')) {
+                console.log(`网络错误，第${attempt + 1}次重试，等待${retryDelay * (attempt + 1)}ms`);
+                await delay(retryDelay * (attempt + 1));
+                continue;
+            }
+            throw error;
+        }
+    }
+}
+
+function escapeXmlText(text) {
+    return text
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&apos;');
+}
+
+/**
+ * 构建兼容多种 voice 的 SSML
+ * - xml:lang 根据 voice 名自动推导（如 en-US-JennyNeural -> en-US）
+ * - style 为空或 "general" 时不使用 <mstts:express-as>
+ * - 避免因无效 style 导致 SSML 被拒
+ */
+function buildEdgeSSML(text, voice, rate, pitch, volume, style) {
+    const escapedText = escapeXmlText(text);
+
+    // 从 voice 名推导 xml:lang，例如：
+    //   zh-CN-XiaoxiaoNeural -> zh-CN
+    //   en-US-JennyNeural    -> en-US
+    const parts = String(voice || '').split('-');
+    const lang = parts.length >= 2 ? `${parts[0]}-${parts[1]}` : 'en-US';
+
+    let inner = escapedText;
+
+    // ★ 只有 style 有效时才使用 mstts:express-as
+    if (style && style !== 'general' && style !== 'default' && style.trim() !== '') {
+        inner = `<mstts:express-as style="${style}" styledegree="2.0">${inner}</mstts:express-as>`;
+    }
+
+    return `<speak xmlns="http://www.w3.org/2001/10/synthesis" ` +
+           `xmlns:mstts="http://www.w3.org/2001/mstts" ` +
+           `version="1.0" xml:lang="${lang}">` +
+           `<voice name="${voice}">` +
+           `<prosody rate="${rate}" pitch="${pitch}" volume="${volume}">` +
+           inner +
+           `</prosody>` +
+           `</voice>` +
+           `</speak>`;
+}
+
+function getSsml(text, voiceName, rate, pitch, volume, style, slien = 0) {
+    const escapedText = escapeXmlText(text);
+
+    let slien_str = '';
+    if (slien > 0) {
+        slien_str = `<break time="${slien}ms" />`;
+    }
+
+    let inner = escapedText;
+    if (style && style !== 'general' && style !== 'default' && style.trim() !== '') {
+        inner = `<mstts:express-as style="${style}" styledegree="2.0">${inner}</mstts:express-as>`;
+    }
+
+    return `<speak xmlns="http://www.w3.org/2001/10/synthesis" xmlns:mstts="http://www.w3.org/2001/mstts" version="1.0" xml:lang="zh-CN">` +
+           `<voice name="${voiceName}">` +
+           `<prosody rate="${rate}" pitch="${pitch}" volume="${volume}">` +
+           inner +
+           `</prosody>` +
+           slien_str +
+           `</voice>` +
+           `</speak>`;
+}
+
+async function getEndpoint() {
+    const now = Date.now() / 1000;
+
+    if (tokenInfo.token && tokenInfo.expiredAt && now < tokenInfo.expiredAt - TOKEN_REFRESH_BEFORE_EXPIRY) {
+        return tokenInfo.endpoint;
+    }
+
+    const endpointUrl = "https://dev.microsofttranslator.com/apps/endpoint?api-version=1.0";
+    const clientId = crypto.randomUUID().replace(/-/g, "");
+
+    try {
+        const response = await fetch(endpointUrl, {
+            method: "POST",
+            headers: {
+                "Accept-Language": "zh-Hans",
+                "X-ClientVersion": "4.0.530a 5fe1dc6c",
+                "X-UserId": "0f04d16a175c411e",
+                "X-HomeGeographicRegion": "zh-Hans-CN",
+                "X-ClientTraceId": clientId,
+                "X-MT-Signature": await sign(endpointUrl),
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36 Edg/127.0.0.0",
+                "Content-Type": "application/json; charset=utf-8",
+                "Content-Length": "0",
+                "Accept-Encoding": "gzip"
+            }
+        });
+
+        if (!response.ok) {
+            throw new Error(`获取endpoint失败: ${response.status}`);
+        }
+
+        const data = await response.json();
+        const jwt = data.t.split(".")[1];
+        const decodedJwt = JSON.parse(atob(jwt));
+
+        tokenInfo = {
+            endpoint: data,
+            token: data.t,
+            expiredAt: decodedJwt.exp
+        };
+
+        return data;
+
+    } catch (error) {
+        console.error("获取endpoint失败:", error);
+        if (tokenInfo.token) {
+            console.log("使用过期的缓存token");
+            return tokenInfo.endpoint;
+        }
+        throw error;
+    }
+}
+
+function makeCORSHeaders() {
+    return {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET,HEAD,POST,OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type, x-api-key",
+        "Access-Control-Max-Age": "86400"
+    };
+}
+
+async function hmacSha256(key, data) {
+    const cryptoKey = await crypto.subtle.importKey(
+        "raw",
+        key,
+        { name: "HMAC", hash: { name: "SHA-256" } },
+        false,
+        ["sign"]
+    );
+    const signature = await crypto.subtle.sign("HMAC", cryptoKey, new TextEncoder().encode(data));
+    return new Uint8Array(signature);
+}
+
+async function base64ToBytes(base64) {
+    const binaryString = atob(base64);
+    const bytes = new Uint8Array(binaryString.length);
+    for (let i = 0; i < binaryString.length; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
+    }
+    return bytes;
+}
+
+async function bytesToBase64(bytes) {
+    return btoa(String.fromCharCode.apply(null, bytes));
+}
+
+function uuid() {
+    return crypto.randomUUID().replace(/-/g, "");
+}
+
+async function sign(urlStr) {
+    const url = urlStr.split("://")[1];
+    const encodedUrl = encodeURIComponent(url);
+    const uuidStr = uuid();
+    const formattedDate = dateFormat();
+    const bytesToSign = `MSTranslatorAndroidApp${encodedUrl}${formattedDate}${uuidStr}`.toLowerCase();
+    const decode = await base64ToBytes("oik6PdDdMnOXemTbwvMn9de/h9lFnfBaCWbGMMZqqoSaQaqUOqjVGm5NqsmjcBI1x+sS9ugjB55HEJWRiFXYFw==");
+    const signData = await hmacSha256(decode, bytesToSign);
+    const signBase64 = await bytesToBase64(signData);
+    return `MSTranslatorAndroidApp::${signBase64}::${formattedDate}::${uuidStr}`;
+}
+
+function dateFormat() {
+    const formattedDate = (new Date()).toUTCString().replace(/GMT/, "").trim() + " GMT";
+    return formattedDate.toLowerCase();
+}
+
+async function handleFileUpload(request) {
+    try {
+        const formData = await request.formData();
+        const file = formData.get('file');
+        const voice = formData.get('voice') || 'zh-CN-XiaoxiaoNeural';
+        const speed = formData.get('speed') || '1.0';
+        const volume = formData.get('volume') || '0';
+        const pitch = formData.get('pitch') || '0';
+        const style = formData.get('style') || 'general';
+
+        if (!file) {
+            return new Response(JSON.stringify({
+                error: { message: "未找到上传的文件", type: "invalid_request_error", param: "file", code: "missing_file" }
+            }), { status: 400, headers: { "Content-Type": "application/json", ...makeCORSHeaders() } });
+        }
+
+        if (!file.type.includes('text/') && !file.name.toLowerCase().endsWith('.txt')) {
+            return new Response(JSON.stringify({
+                error: { message: "不支持的文件类型，请上传txt文件", type: "invalid_request_error", param: "file", code: "invalid_file_type" }
+            }), { status: 400, headers: { "Content-Type": "application/json", ...makeCORSHeaders() } });
+        }
+
+        if (file.size > 500 * 1024) {
+            return new Response(JSON.stringify({
+                error: { message: "文件大小超过限制（最大500KB）", type: "invalid_request_error", param: "file", code: "file_too_large" }
+            }), { status: 400, headers: { "Content-Type": "application/json", ...makeCORSHeaders() } });
+        }
+
+        const text = await file.text();
+        
+        if (!text.trim()) {
+            return new Response(JSON.stringify({
+                error: { message: "文件内容为空", type: "invalid_request_error", param: "file", code: "empty_file" }
+            }), { status: 400, headers: { "Content-Type": "application/json", ...makeCORSHeaders() } });
+        }
+
+        if (text.length > 10000) {
+            return new Response(JSON.stringify({
+                error: { message: "文本内容过长（最大10000字符）", type: "invalid_request_error", param: "file", code: "text_too_long" }
+            }), { status: 400, headers: { "Content-Type": "application/json", ...makeCORSHeaders() } });
+        }
+
+        let rate = parseInt(String((parseFloat(speed) - 1.0) * 100));
+        let numVolume = parseInt(String(parseFloat(volume) * 100));
+        let numPitch = parseInt(pitch);
+
+        return await getVoice(
+            text,
+            voice,
+            rate >= 0 ? `+${rate}%` : `${rate}%`,
+            numPitch >= 0 ? `+${numPitch}Hz` : `${numPitch}Hz`,
+            numVolume >= 0 ? `+${numVolume}%` : `${numVolume}%`,
+            style,
+            "audio-24khz-48kbitrate-mono-mp3"
+        );
+
+    } catch (error) {
+        console.error("文件上传处理失败:", error);
+        return new Response(JSON.stringify({
+            error: { message: "文件处理失败", type: "api_error", param: null, code: "file_processing_error" }
+        }), { status: 500, headers: { "Content-Type": "application/json", ...makeCORSHeaders() } });
+    }
+}
+
+async function handleAudioTranscription(request) {
+    try {
+        if (request.method !== 'POST') {
+            return new Response(JSON.stringify({
+                error: { message: "只支持POST方法", type: "invalid_request_error", param: "method", code: "method_not_allowed" }
+            }), { status: 405, headers: { "Content-Type": "application/json", ...makeCORSHeaders() } });
+        }
+
+        const contentType = request.headers.get("content-type") || "";
+        
+        if (!contentType.includes("multipart/form-data")) {
+            return new Response(JSON.stringify({
+                error: { message: "请求必须使用multipart/form-data格式", type: "invalid_request_error", param: "content-type", code: "invalid_content_type" }
+            }), { status: 400, headers: { "Content-Type": "application/json", ...makeCORSHeaders() } });
+        }
+
+        const formData = await request.formData();
+        const audioFile = formData.get('file');
+        const customToken = formData.get('token');
+
+        if (!audioFile) {
+            return new Response(JSON.stringify({
+                error: { message: "未找到音频文件", type: "invalid_request_error", param: "file", code: "missing_file" }
+            }), { status: 400, headers: { "Content-Type": "application/json", ...makeCORSHeaders() } });
+        }
+
+        if (audioFile.size > 10 * 1024 * 1024) {
+            return new Response(JSON.stringify({
+                error: { message: "音频文件大小不能超过10MB", type: "invalid_request_error", param: "file", code: "file_too_large" }
+            }), { status: 400, headers: { "Content-Type": "application/json", ...makeCORSHeaders() } });
+        }
+
+        const allowedTypes = ['audio/mpeg','audio/mp3','audio/wav','audio/m4a','audio/flac','audio/aac','audio/ogg','audio/webm','audio/amr','audio/3gpp'];
+        const isValidType = allowedTypes.some(type => 
+            audioFile.type.includes(type) || 
+            audioFile.name.toLowerCase().match(/\.(mp3|wav|m4a|flac|aac|ogg|webm|amr|3gp)$/i)
+        );
+
+        if (!isValidType) {
+            return new Response(JSON.stringify({
+                error: { message: "不支持的音频文件格式", type: "invalid_request_error", param: "file", code: "invalid_file_type" }
+            }), { status: 400, headers: { "Content-Type": "application/json", ...makeCORSHeaders() } });
+        }
+
+        const token = customToken || 'sk-wtldsvuprmwltxpbspbmawtolbacghzawnjhtlzlnujjkfhh';
+
+        const apiFormData = new FormData();
+        apiFormData.append('file', audioFile);
+        apiFormData.append('model', 'FunAudioLLM/SenseVoiceSmall');
+
+        const apiResponse = await fetch('https://api.siliconflow.cn/v1/audio/transcriptions', {
+            method: 'POST',
+            headers: { 'Authorization': `Bearer ${token}` },
+            body: apiFormData
+        });
+
+        if (!apiResponse.ok) {
+            const errorText = await apiResponse.text();
+            console.error('硅基流动API错误:', apiResponse.status, errorText);
+            let errorMessage = '语音转录服务暂时不可用';
+            if (apiResponse.status === 401) errorMessage = 'API Token无效，请检查您的配置';
+            else if (apiResponse.status === 429) errorMessage = '请求过于频繁，请稍后再试';
+            else if (apiResponse.status === 413) errorMessage = '音频文件太大，请选择较小的文件';
+
+            return new Response(JSON.stringify({
+                error: { message: errorMessage, type: "api_error", param: null, code: "transcription_api_error" }
+            }), { status: apiResponse.status, headers: { "Content-Type": "application/json", ...makeCORSHeaders() } });
+        }
+
+        const transcriptionResult = await apiResponse.json();
+
+        return new Response(JSON.stringify(transcriptionResult), {
+            headers: { "Content-Type": "application/json", ...makeCORSHeaders() }
+        });
+
+    } catch (error) {
+        console.error("语音转录处理失败:", error);
+        return new Response(JSON.stringify({
+            error: { message: "语音转录处理失败", type: "api_error", param: null, code: "transcription_processing_error" }
+        }), { status: 500, headers: { "Content-Type": "application/json", ...makeCORSHeaders() } });
+    }
+}
+
+// ============================================================================
+// ===================== Edge TTS WebSocket（带 WordBoundary） =====================
+// ============================================================================
+
+async function generateSecMsGecToken() {
+    // Windows file-time epoch (1601-01-01 到 1970-01-01 的秒数)
+    const WIN_EPOCH = 11644473600n;
+    const S_TO_NS = 10000000n;  // 100ns 单位
+
+    const nowSec = BigInt(Math.floor(Date.now() / 1000));
+    let ticks = (nowSec + WIN_EPOCH) * S_TO_NS;
+
+    // 取整到最近的 5 分钟（300 秒 = 3000000000 * 100ns）
+    const roundTo = 300n * 10000000n;
+    ticks = (ticks / roundTo) * roundTo;
+
+    const input = `${ticks}${EDGE_TTS_TRUSTED_CLIENT_TOKEN}`;
+    const data = new TextEncoder().encode(input);
+    const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+    const hashArray = Array.from(new Uint8Array(hashBuffer));
+    return hashArray.map(b => b.toString(16).padStart(2, '0')).join('').toUpperCase();
+}
+
+function generateConnectionId() {
+    return crypto.randomUUID().replace(/-/g, '');
+}
+
+function arrayBufferToBase64(buffer) {
+    let binary = '';
+    const bytes = new Uint8Array(buffer);
+    const chunkSize = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunkSize) {
+        binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+    }
+    return btoa(binary);
+}
+
+/**
+ * 通过 Edge TTS WebSocket 合成，返回音频块和 WordBoundary 列表
+ * Cloudflare Workers 必须通过 fetch + Upgrade 头建立出站 WebSocket，
+ * 且 URL 必须使用 https:// 而非 wss://
+ *
+ * ★ 修复：Cloudflare Workers 的 WebSocket 二进制帧 event.data 是 ArrayBuffer
+ *        （不是 Blob），旧代码用 blob.arrayBuffer() 判断，会丢弃所有音频帧。
+ */
+async function synthesizeWithWordBoundaries(text, voice, rate, pitch, volume, style) {
+    const secMsGec = await generateSecMsGecToken();
+    const connectionId = generateConnectionId();
+    const requestId = generateConnectionId();
+
+    const url =
+        `https://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1` +
+        `?TrustedClientToken=${EDGE_TTS_TRUSTED_CLIENT_TOKEN}` +
+        `&Sec-MS-GEC=${secMsGec}` +
+        `&Sec-MS-GEC-Version=${EDGE_TTS_SEC_MS_GEC_VERSION}` +
+        `&ConnectionId=${connectionId}`;
+
+    const resp = await fetch(url, {
+        headers: {
+            'Upgrade': 'websocket',
+            'Connection': 'Upgrade',
+            'Sec-WebSocket-Version': '13',
+            'Origin': 'chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36 Edg/132.0.0.0',
+            'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8'
+        }
+    });
+
+    if (resp.status !== 101) {
+        let detail = '';
+        try { detail = await resp.text(); } catch (e) {}
+        throw new Error(`WebSocket 升级失败 (HTTP ${resp.status})${detail ? ': ' + detail.slice(0, 200) : ''}`);
+    }
+
+    const ws = resp.webSocket;
+    if (!ws) {
+        throw new Error('WebSocket 升级失败：response.webSocket 为空');
+    }
+
+    ws.accept();
+
+    return new Promise((resolve, reject) => {
+        const audioChunks = [];
+        const wordBoundaries = [];
+        let resolved = false;
+        let pendingBinary = Promise.resolve();
+
+        const cleanup = () => {
+            try { ws.close(); } catch (e) {}
+        };
+
+        const fail = (err) => {
+            if (resolved) return;
+            resolved = true;
+            cleanup();
+            reject(err);
+        };
+
+        const timeout = setTimeout(() => fail(new Error('Edge TTS 连接超时')), 25000);
+
+        ws.addEventListener('message', (event) => {
+            const data = event.data;
+
+            // —— 文本帧：metadata / turn.end ——
+            if (typeof data === 'string') {
+                if (data.indexOf('Path:audio.metadata') !== -1) {
+                    const jsonStart = data.indexOf('{');
+                    if (jsonStart !== -1) {
+                        try {
+                            const meta = JSON.parse(data.slice(jsonStart));
+                            if (meta && Array.isArray(meta.Metadata)) {
+                                for (const item of meta.Metadata) {
+                                    if (item.Type === 'WordBoundary' && item.Data) {
+                                        wordBoundaries.push({
+                                            text: item.Data.text && item.Data.text.Text ? item.Data.text.Text : '',
+                                            offsetSec: item.Data.Offset / 10000000,
+                                            durationSec: item.Data.Duration / 10000000
+                                        });
+                                    }
+                                }
+                            }
+                        } catch (e) {}
+                    }
+                }
+                if (data.indexOf('Path:turn.end') !== -1) {
+                    clearTimeout(timeout);
+                    pendingBinary.then(() => {
+                        if (resolved) return;
+                        resolved = true;
+                        cleanup();
+                        resolve({ audioChunks, wordBoundaries });
+                    });
+                }
+                return;
+            }
+
+            // —— 二进制帧：兼容 ArrayBuffer / TypedArray / Blob ——
+            // ★ Cloudflare Workers 中 event.data 是 ArrayBuffer，没有 .arrayBuffer() 方法
+            let bufferPromise;
+            if (data instanceof ArrayBuffer) {
+                bufferPromise = Promise.resolve(data);
+            } else if (ArrayBuffer.isView(data)) {
+                bufferPromise = Promise.resolve(
+                    data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength)
+                );
+            } else if (data && typeof data.arrayBuffer === 'function') {
+                // 兜底：某些环境可能是 Blob
+                bufferPromise = data.arrayBuffer();
+            } else {
+                return;
+            }
+
+            pendingBinary = pendingBinary.then(() => {
+                return bufferPromise.then((buffer) => {
+                    if (!buffer || buffer.byteLength < 2) return;
+                    const view = new DataView(buffer);
+                    const headerLength = view.getUint16(0, false);
+                    if (buffer.byteLength < 2 + headerLength) return;
+                    const headerText = new TextDecoder().decode(
+                        new Uint8Array(buffer, 2, headerLength)
+                    );
+                    if (headerText.indexOf('Path:audio') !== -1) {
+                        const audioData = buffer.slice(2 + headerLength);
+                        if (audioData.byteLength > 0) {
+                            audioChunks.push(audioData);
+                        }
+                    }
+                });
+            });
+        });
+
+        ws.addEventListener('close', (e) => {
+            clearTimeout(timeout);
+            if (!resolved) {
+                pendingBinary.then(() => {
+                    if (!resolved) {
+                        if (audioChunks.length > 0) {
+                            resolved = true;
+                            resolve({ audioChunks, wordBoundaries });
+                        } else {
+                            fail(new Error(`Edge TTS 连接关闭 (code ${e.code}, reason: ${e.reason || 'unknown'})`));
+                        }
+                    }
+                });
+            }
+        });
+
+        ws.addEventListener('error', () => {
+            clearTimeout(timeout);
+            fail(new Error('Edge TTS WebSocket 错误事件'));
+        });
+
+        try {
+            const configMsg = {
+                context: {
+                    synthesis: {
+                        audio: {
+                            metadataoptions: {
+                                sentenceBoundaryEnabled: false,
+                                wordBoundaryEnabled: true
+                            },
+                            outputFormat: EDGE_TTS_OUTPUT_FORMAT
+                        }
+                    }
+                }
+            };
+            ws.send(
+                `X-Timestamp:${Date.now() / 1000}\r\n` +
+                `Content-Type:application/json; charset=utf-8\r\n` +
+                `Path:speech.config\r\n\r\n` +
+                JSON.stringify(configMsg)
+            );
+
+            const ssml = buildEdgeSSML(text, voice, rate, pitch, volume, style);
+
+            ws.send(
+                `X-RequestId:${requestId}\r\n` +
+                `Content-Type:application/ssml+xml\r\n` +
+                `X-Timestamp:${new Date().toISOString()}\r\n` +
+                `Path:ssml\r\n\r\n` +
+                ssml
+            );
+        } catch (e) {
+            clearTimeout(timeout);
+            fail(new Error('发送 SSML 失败: ' + e.message));
+        }
+    });
+}
+
+/**
+ * 新端点：返回 base64 音频 + WordBoundary
+ */
+async function handleSpeechWithTimings(request) {
+    try {
+        const requestBody = await request.json();
+        console.log('[speech-with-timings] input length:', requestBody.input?.length, 'voice:', requestBody.voice);
+        const {
+            input,
+            voice = "zh-CN-XiaoxiaoNeural",
+            speed = '1.0',
+            volume = '0',
+            pitch = '0',
+            style = "general"
+        } = requestBody;
+
+        if (!input || !input.trim()) {
+            return new Response(JSON.stringify({
+                error: { message: "输入文本不能为空" }
+            }), {
+                status: 400,
+                headers: { "Content-Type": "application/json", ...makeCORSHeaders() }
+            });
+        }
+
+        if (input.length > 2000) {
+            return new Response(JSON.stringify({
+                error: {
+                    message: "文本过长（超过 2000 字符），请缩短文本或使用 /v1/audio/speech 普通模式"
+                }
+            }), {
+                status: 400,
+                headers: { "Content-Type": "application/json", ...makeCORSHeaders() }
+            });
+        }
+
+        // ★ NaN 兜底
+        const parsedSpeed = parseFloat(speed);
+        const rate = isNaN(parsedSpeed) ? 0 : parseInt(String((parsedSpeed - 1.0) * 100));
+        const parsedVolume = parseFloat(volume);
+        const numVolume = isNaN(parsedVolume) ? 0 : parseInt(String(parsedVolume * 100));
+        const parsedPitch = parseInt(pitch);
+        const numPitch = isNaN(parsedPitch) ? 0 : parsedPitch;
+
+        const rateStr = rate >= 0 ? `+${rate}%` : `${rate}%`;
+        const pitchStr = numPitch >= 0 ? `+${numPitch}Hz` : `${numPitch}Hz`;
+        const volumeStr = numVolume >= 0 ? `+${numVolume}%` : `${numVolume}%`;
+
+        const { audioChunks, wordBoundaries } = await synthesizeWithWordBoundaries(
+            input.trim(), voice, rateStr, pitchStr, volumeStr, style
+        );
+
+        if (!audioChunks.length) {
+            throw new Error('Edge TTS 未返回任何音频数据');
+        }
+
+        let totalLength = 0;
+        for (const chunk of audioChunks) totalLength += chunk.byteLength;
+        const merged = new Uint8Array(totalLength);
+        let offset = 0;
+        for (const chunk of audioChunks) {
+            merged.set(new Uint8Array(chunk), offset);
+            offset += chunk.byteLength;
+        }
+
+        const base64Audio = arrayBufferToBase64(merged.buffer);
+
+        return new Response(JSON.stringify({
+            audio: base64Audio,
+            format: 'audio/mpeg',
+            wordBoundaries
+        }), {
+            headers: {
+                "Content-Type": "application/json",
+                ...makeCORSHeaders()
+            }
+        });
+
+    } catch (error) {
+        console.error("Speech with timings error:", error);
+        console.error("Stack:", error.stack);
+        return new Response(JSON.stringify({
+            error: {
+                message: error.message || String(error),
+                type: "api_error",
+                code: "edge_tts_timings_error"
+            }
+        }), {
+            status: 500,
+            headers: { "Content-Type": "application/json", ...makeCORSHeaders() }
+        });
+    }
+}
