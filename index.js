@@ -8,7 +8,7 @@ let tokenInfo = {
 // ===================== Edge TTS WebSocket 常量（用于 WordBoundary） =====================
 const EDGE_TTS_TRUSTED_CLIENT_TOKEN = "6A5AA1D4EAFF4E9FB37E23D68491D6F4";
 const EDGE_TTS_OUTPUT_FORMAT = "audio-24khz-48kbitrate-mono-mp3";
-const EDGE_TTS_SEC_MS_GEC_VERSION = "2-155.0.4283.45";
+const EDGE_TTS_SEC_MS_GEC_VERSION = "1-133.0.3065.92";
 
 // HTML 页面模板
 const HTML_PAGE = `
@@ -2290,35 +2290,25 @@ async function handleAudioTranscription(request) {
 // ===================== Edge TTS WebSocket（带 WordBoundary） =====================
 // ============================================================================
 
-// Sec-MS-GEC v2 implementation for Cloudflare Workers.
-// Based on the interoperable implementation used by cloudflare-edge-tts / edge-tts 7.3.
-const SEC_GEC_WIN_EPOCH_SECONDS = 11644473600;
-const SEC_GEC_TOKEN_WINDOW_SECONDS = 300;
-const SEC_GEC_SHA256_INITIAL = [0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19];
-const SEC_GEC_SHA256_PREFIX_STATE = [0xfd9fbea2,0x91243ce7,0xbe499094,0xcd2e1e0a,0x6c006f49,0x04bd35ab,0xfeb0a7e4,0x03effbd2];
-const SEC_GEC_SHA256_PREFIX_SCHEDULE = [0xeb24bf9e,0x1558691f,0xa0c09ee2,0x0cfa32ba,0xa622ee8c,0xd1dd9491,0xc0dd25a0,0xf9e70ab6,0xf0c31573,0x7058ce4e,0x7188e606,0x00e5ab33,0xd258b060,0x72766564];
-const SEC_GEC_SHA256_ROUND_CONSTANTS = [0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2];
-const SEC_GEC_SHA256_ROUND_14_ADJUSTMENT = 0xc9dc06a7;
-const SEC_GEC_SHA256_PREFIX_BLOCK_CONSTANTS = SEC_GEC_SHA256_ROUND_CONSTANTS.map((c,i)=>i===14?SEC_GEC_SHA256_ROUND_14_ADJUSTMENT:c);
-const SEC_GEC_SHA256_SIGMA0_ADJUSTMENT = 0x059c0b80;
-const SEC_GEC_SHA256_SIGMA1_ADJUSTMENT = 0x000b92c0;
-const SEC_GEC_CS64_COEFFICIENTS = [[0xe82e91b1,0xb32700d0],[0x44de24c6,0x88dff51d],[0x3beb65bc,0x29514038],[0xc89c5933,0xb328cbdf],[0x8d1ec211,0xd405b4d5],[0x314ef5d5,0x26e55f3c],[0xe92491b1,0x607801c6],[0xf0a5b9d5,0x82b2c1fb],[0x06064cf3,0xfa51a3da],[0xda79fa60,0x207cc464],[0xbed20560,0x3c3c74f3],[0x89f9c9f8,0xd2d14b61],[0x35fa38c6,0xbb04a2c1],[0xcb49e3c6,0xc5626167]];
-const SEC_GEC_CS64_FACTOR = 0x82893933;
-const SEC_GEC_CS64_ADJUSTMENT0 = 0xf2f90b1a;
-const SEC_GEC_CS64_ADJUSTMENT1 = 0x0b1a0000;
-function secGecRol16(v){return ((v<<16)|(v>>>16))>>>0;}
-function secGecRotr(v,n){return ((v>>>n)|(v<<(32-n)))>>>0;}
-function secGecSigma0(v){return (secGecRotr(v,7)^secGecRotr(v,18)^(v>>>3))>>>0;}
-function secGecSigma1(v){return (secGecRotr(v,17)^secGecRotr(v,19)^(v>>>10))>>>0;}
-function secGecExpandSchedule(w,first=16){for(let i=first;i<64;i++)w[i]=(secGecSigma1(w[i-2])+w[i-7]+secGecSigma0(w[i-15])+w[i-16])>>>0;}
-function secGecCompress(state,words,firstRound=0){const k=firstRound===14?SEC_GEC_SHA256_PREFIX_BLOCK_CONSTANTS:SEC_GEC_SHA256_ROUND_CONSTANTS;let [a,b,c,d,e,f,g,h]=state;for(let i=firstRound;i<64;i++){const rE=((e>>>6|e<<26)^(e>>>11|e<<21)^(e>>>25|e<<7))>>>0;const rA=((a>>>2|a<<30)^(a>>>13|a<<19)^(a>>>22|a<<10))>>>0;const t1=(h+rE+(g^(e&(f^g)))+k[i]+words[i])>>>0;const t2=(rA+((a&b)|(c&(a|b))))>>>0;h=g;g=f;f=e;e=(d+t1)>>>0;d=c;c=b;b=a;a=(t1+t2)>>>0;}return [a,b,c,d,e,f,g,h];}
-function secGecPrefixBlockState(payload){const w=new Array(14).fill(0);w.push((payload[0]<<16)|(payload[1]<<8)|payload[2]);w.push(((payload[3]<<24)|(payload[4]<<16)|(payload[5]<<8)|payload[6])>>>0);for(let i=16;i<30;i++){let v=SEC_GEC_SHA256_PREFIX_SCHEDULE[i-16]+(i===16?((secGecSigma1(w[14])^SEC_GEC_SHA256_SIGMA1_ADJUSTMENT)>>>0):secGecSigma1(w[i-2]));if(i>=21)v+=w[i-7];if(i===29)v+=(secGecSigma0(w[14])^SEC_GEC_SHA256_SIGMA0_ADJUSTMENT)>>>0;w.push(v>>>0);}w.push((secGecSigma1(w[28])+w[23]+secGecSigma0(w[15])+w[14]+SEC_GEC_SHA256_ROUND_14_ADJUSTMENT-SEC_GEC_SHA256_ROUND_CONSTANTS[14])>>>0);secGecExpandSchedule(w,31);const working=secGecCompress(SEC_GEC_SHA256_PREFIX_STATE,w,14);return SEC_GEC_SHA256_INITIAL.map((v,i)=>(v+working[i])>>>0);}
-function secGecSha256Digest(payload){if(payload.length<7)throw new Error('Sec-MS-GEC payload must contain at least seven bytes');const messageLength=57+payload.length;const zeroPadding=(((55-messageLength)%64)+64)%64;const tail=new Uint8Array(payload.length-7+1+zeroPadding+8);tail.set(payload.subarray(7));tail[payload.length-7]=0x80;const view=new DataView(tail.buffer);const bitLength=messageLength*8;view.setUint32(tail.length-8,Math.floor(bitLength/2**32));view.setUint32(tail.length-4,bitLength>>>0);let state=secGecPrefixBlockState(payload);for(let off=0;off<tail.length;off+=64){const words=[];for(let i=0;i<16;i++)words.push(view.getUint32(off+i*4));secGecExpandSchedule(words);const working=secGecCompress(state,words);state=state.map((v,i)=>(v+working[i])>>>0);}const digest=new Uint8Array(32);const dv=new DataView(digest.buffer);state.forEach((v,i)=>dv.setUint32(i*4,v));return digest;}
-function secGecCs64Words(payload){const length=Math.ceil((payload.length+1)/8)*8;const bytes=new Uint8Array(length);bytes.set(payload,1);const view=new DataView(bytes.buffer);const words=[];for(let off=0;off<length;off+=4)words.push(view.getUint32(off,true));return words;}
-function secGecCs64Digest(payload,digest){const dv=new DataView(digest.buffer,digest.byteOffset,digest.byteLength);const keyA=(dv.getUint32(0,true)|1)>>>0,keyB=(dv.getUint32(4,true)|1)>>>0;const factors=[Math.imul(keyA,SEC_GEC_CS64_FACTOR)>>>0,Math.imul(keyB,SEC_GEC_CS64_FACTOR)>>>0];const terms=SEC_GEC_CS64_COEFFICIENTS.map(([c],i)=>Math.imul(c,factors[i%2])>>>0);const offsets=SEC_GEC_CS64_COEFFICIENTS.map(([,o])=>o);secGecCs64Words(payload).forEach((word,i)=>{const even=i%2===0;let term=Math.imul(word,even?keyA:keyB);let offset=Math.imul(secGecRol16(word),even?0xef0569fb:0xc31713db);if(i===0){term+=Math.imul(SEC_GEC_CS64_ADJUSTMENT0,factors[0]);offset+=SEC_GEC_CS64_ADJUSTMENT1;}terms.push(term>>>0);offsets.push(offset>>>0);});let swapAcc=0,swapLast=0,state=0,acc=0;for(let i=0;i<terms.length;i+=2){const x=terms[i],y=terms[i+1];let q=Math.imul(secGecRol16((offsets[i]+x)>>>0),0x76f50f34)>>>0;swapAcc=(swapAcc+Math.imul(secGecRol16(q),0xc3efea97)+q)>>>0;q=Math.imul(secGecRol16((offsets[i+1]+y)>>>0),0x1881ce3c)>>>0;swapLast=(Math.imul(secGecRol16(q),0x35bd1ec9)+q)>>>0;swapAcc=(swapAcc+swapLast)>>>0;state=(Math.imul(state,keyA)+x)>>>0;state=Math.imul(secGecRol16(state),0xcf98b111)>>>0;state=Math.imul(secGecRol16(state),0x87085b9f)>>>0;state=Math.imul(secGecRol16(state),0x12ceb96d)>>>0;state=Math.imul(secGecRol16(state),0x257e1d83)>>>0;acc=(acc+state)>>>0;let t=(Math.imul(state,keyB)+y)>>>0;t=Math.imul(secGecRol16(t),0xa27416f5)>>>0;t=Math.imul(secGecRol16(t),0xd38396ff)>>>0;t=Math.imul(secGecRol16(t),0x7c932b89)>>>0;state=Math.imul(secGecRol16(t),0xbfa49f69)>>>0;acc=(acc+state)>>>0;}return [(swapLast^state)>>>0,(swapAcc^acc)>>>0];}
-function secGecToHex(bytes){return Array.from(bytes).map(b=>b.toString(16).padStart(2,'0')).join('').toUpperCase();}
-function hashSecMsGecPayload(payload){const bytes=new TextEncoder().encode(payload);const digest=secGecSha256Digest(bytes);const checksum=new Uint8Array(8);const view=new DataView(checksum.buffer);secGecCs64Digest(bytes,digest).forEach((v,i)=>view.setUint32(i*4,v,true));return `${secGecToHex(checksum)}-${secGecToHex(digest)}`;}
-async function generateSecMsGecToken(){let ticks=Date.now()/1000+SEC_GEC_WIN_EPOCH_SECONDS;ticks-=ticks%SEC_GEC_TOKEN_WINDOW_SECONDS;ticks*=1e7;return hashSecMsGecPayload(`${ticks.toFixed(0)}${EDGE_TTS_TRUSTED_CLIENT_TOKEN}`);}
+async function generateSecMsGecToken() {
+    // Windows file-time epoch (1601-01-01 到 1970-01-01 的秒数)
+    const WIN_EPOCH = 11644473600n;
+    const S_TO_NS = 10000000n;  // 100ns 单位
+
+    const nowSec = BigInt(Math.floor(Date.now() / 1000));
+    let ticks = (nowSec + WIN_EPOCH) * S_TO_NS;
+
+    // 取整到最近的 5 分钟（300 秒 = 3000000000 * 100ns）
+    const roundTo = 300n * 10000000n;
+    ticks = (ticks / roundTo) * roundTo;
+
+    const input = `${ticks}${EDGE_TTS_TRUSTED_CLIENT_TOKEN}`;
+    const data = new TextEncoder().encode(input);
+    const hashBuffer = await crypto.subtle.digest('SHA-256', data);
+    const hashArray = Array.from(new Uint8Array(hashBuffer));
+    return hashArray.map(b => b.toString(16).padStart(2, '0')).join('').toUpperCase();
+}
+
 function generateConnectionId() {
     return crypto.randomUUID().replace(/-/g, '');
 }
@@ -2347,8 +2337,8 @@ async function synthesizeWithWordBoundaries(text, voice, rate, pitch, volume, st
     const requestId = generateConnectionId();
 
     const url =
-        `https://api.msedgeservices.com/tts/cognitiveservices/websocket/v1` +
-        `?Ocp-Apim-Subscription-Key=${EDGE_TTS_TRUSTED_CLIENT_TOKEN}` +
+        `https://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1` +
+        `?TrustedClientToken=${EDGE_TTS_TRUSTED_CLIENT_TOKEN}` +
         `&Sec-MS-GEC=${secMsGec}` +
         `&Sec-MS-GEC-Version=${EDGE_TTS_SEC_MS_GEC_VERSION}` +
         `&ConnectionId=${connectionId}`;
