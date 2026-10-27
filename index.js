@@ -5,10 +5,16 @@ let tokenInfo = {
     expiredAt: null
 };
 
-// ===================== Edge TTS WebSocket 常量（用于 WordBoundary） =====================
+// ===================== Edge TTS WebSocket 常量 =====================
 const EDGE_TTS_TRUSTED_CLIENT_TOKEN = "6A5AA1D4EAFF4E9FB37E23D68491D6F4";
 const EDGE_TTS_OUTPUT_FORMAT = "audio-24khz-48kbitrate-mono-mp3";
-const EDGE_TTS_SEC_MS_GEC_VERSION = "1-133.0.3065.92";
+
+// ★ v2：版本号必须以 "2-" 开头，Chromium 版本跟随 edge-tts 当前常量
+const EDGE_TTS_SEC_MS_GEC_VERSION = "2-143.0.3650.75";
+
+// ★ v2 token 固定前缀（微软版权常量）
+const EDGE_TTS_SEC_MS_GEC_V2_PREFIX =
+    "Copyright (C) Microsoft Corporation. All rights reserved. ";
 
 // HTML 页面模板
 const HTML_PAGE = `
@@ -1006,7 +1012,7 @@ const HTML_PAGE = `
                                 <option value="zh-CN-XiaoyouNeural">晓悠 (女声·悠扬)</option>
                                 <option value="zh-CN-XiaozhenNeural">晓甄 (女声·端庄)</option>
                                 <option value="zh-CN-YunfengNeural">云枫 (男声·磁性)</option>
-                                <option value="zh-CN-YunhaoNeural">云皓 (男声·豪迈)</option>
+                                <option value="zh-CN-YunhaoNeural">云浩 (男声·豪迈)</option>
                                 <option value="zh-CN-YunxiaNeural">云夏 (男声·热情)</option>
                                 <option value="zh-CN-YunyeNeural">云野 (男声·野性)</option>
                                 <option value="zh-CN-YunzeNeural">云泽 (男声·深沉)</option>
@@ -1672,7 +1678,6 @@ async function handleRequest(request) {
     const requestUrl = new URL(request.url);
     const path = requestUrl.pathname;
 
-    // 返回前端页面
     if (path === "/" || path === "/index.html") {
         return new Response(HTML_PAGE, {
             headers: {
@@ -1704,7 +1709,6 @@ async function handleRequest(request) {
         }
     }
 
-    // ★ 返回音频 + WordBoundary 时间戳的端点（用于精确朗读高亮）
     if (path === "/v1/audio/speech-with-timings") {
         try {
             return await handleSpeechWithTimings(request);
@@ -1922,7 +1926,7 @@ async function getAudioChunk(text, voiceName, rate, pitch, volume, style, output
                 headers: {
                     "Authorization": endpoint.t,
                     "Content-Type": "application/ssml+xml",
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36 Edg/127.0.0.0",
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0",
                     "X-Microsoft-OutputFormat": outputFormat
                 },
                 body: getSsml(text, voiceName, rate, pitch, volume, style, slien)
@@ -1975,24 +1979,14 @@ function escapeXmlText(text) {
         .replace(/'/g, '&apos;');
 }
 
-/**
- * 构建兼容多种 voice 的 SSML
- * - xml:lang 根据 voice 名自动推导（如 en-US-JennyNeural -> en-US）
- * - style 为空或 "general" 时不使用 <mstts:express-as>
- * - 避免因无效 style 导致 SSML 被拒
- */
 function buildEdgeSSML(text, voice, rate, pitch, volume, style) {
     const escapedText = escapeXmlText(text);
 
-    // 从 voice 名推导 xml:lang，例如：
-    //   zh-CN-XiaoxiaoNeural -> zh-CN
-    //   en-US-JennyNeural    -> en-US
     const parts = String(voice || '').split('-');
     const lang = parts.length >= 2 ? `${parts[0]}-${parts[1]}` : 'en-US';
 
     let inner = escapedText;
 
-    // ★ 只有 style 有效时才使用 mstts:express-as
     if (style && style !== 'general' && style !== 'default' && style.trim() !== '') {
         inner = `<mstts:express-as style="${style}" styledegree="2.0">${inner}</mstts:express-as>`;
     }
@@ -2051,7 +2045,7 @@ async function getEndpoint() {
                 "X-HomeGeographicRegion": "zh-Hans-CN",
                 "X-ClientTraceId": clientId,
                 "X-MT-Signature": await sign(endpointUrl),
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36 Edg/127.0.0.0",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0",
                 "Content-Type": "application/json; charset=utf-8",
                 "Content-Length": "0",
                 "Accept-Encoding": "gzip"
@@ -2290,23 +2284,163 @@ async function handleAudioTranscription(request) {
 // ===================== Edge TTS WebSocket（带 WordBoundary） =====================
 // ============================================================================
 
+/**
+ * ★ v2 Sec-MS-GEC token 生成
+ *
+ * v2 与 v1 的相同部分：
+ *   - 时间基准：Windows FILETIME ticks（100ns 单位），取整到最近的 5 分钟窗口
+ *   - 待哈希主体：`<ticks><TrustedClientToken>`
+ *
+ * v2 与 v1 的区别：
+ *   - 在主体前拼接微软版权常量
+ *   - 同时计算 CS64（一个基于 32-bit word 的自定义哈希）和 SHA-256
+ *   - 最终返回 `<16 hex CS64>-<64 hex SHA256>`
+ *
+ * 参考：rany2/edge-tts PR #492（已用 Edge 155 线上捕获的 token 逐字节验证）
+ */
 async function generateSecMsGecToken() {
-    // Windows file-time epoch (1601-01-01 到 1970-01-01 的秒数)
+    // Windows FILETIME epoch：1601-01-01 到 1970-01-01 的秒数
     const WIN_EPOCH = 11644473600n;
-    const S_TO_NS = 10000000n;  // 100ns 单位
+    // 1 秒 = 10^7 个 100ns tick
+    const S_TO_NS = 10000000n;
 
     const nowSec = BigInt(Math.floor(Date.now() / 1000));
     let ticks = (nowSec + WIN_EPOCH) * S_TO_NS;
 
-    // 取整到最近的 5 分钟（300 秒 = 3000000000 * 100ns）
+    // 取整到最近的 5 分钟（300 秒 = 300 * 10^7 ticks）
     const roundTo = 300n * 10000000n;
     ticks = (ticks / roundTo) * roundTo;
 
-    const input = `${ticks}${EDGE_TTS_TRUSTED_CLIENT_TOKEN}`;
+    // ★ v2 在 ticks 前拼接版权常量
+    const suffix = `${ticks}${EDGE_TTS_TRUSTED_CLIENT_TOKEN}`;
+    const input = EDGE_TTS_SEC_MS_GEC_V2_PREFIX + suffix;
     const data = new TextEncoder().encode(input);
-    const hashBuffer = await crypto.subtle.digest('SHA-256', data);
-    const hashArray = Array.from(new Uint8Array(hashBuffer));
-    return hashArray.map(b => b.toString(16).padStart(2, '0')).join('').toUpperCase();
+
+    // SHA-256（用于 64 位 hex 部分，同时其 digest 也参与 CS64 的 key）
+    const sha256Buffer = await crypto.subtle.digest('SHA-256', data);
+    const sha256Bytes = new Uint8Array(sha256Buffer);
+    const sha256Hex = bytesToHex(sha256Bytes);
+
+    // CS64（用于 16 位 hex 部分）
+    const cs64Hex = computeCs64(data, sha256Bytes);
+
+    return `${cs64Hex}-${sha256Hex}`;
+}
+
+function bytesToHex(bytes) {
+    let hex = '';
+    for (let i = 0; i < bytes.length; i++) {
+        hex += bytes[i].toString(16).padStart(2, '0');
+    }
+    return hex.toUpperCase();
+}
+
+/**
+ * CS64 哈希：对输入做两组 word 运算，结果异或后输出 16 位 hex
+ * 移植自 rany2/edge-tts v2 实现（_cs64_word_swap + _cs64_reversible）
+ */
+function computeCs64(dataBytes, sha256Bytes) {
+    const dataWords = wordsLe4Even(dataBytes);
+    const keyWords = wordsLe4Even(sha256Bytes);
+
+    const [x0, y0] = cs64WordSwap(dataWords, keyWords);
+    const [x1, y1] = cs64Reversible(dataWords, keyWords);
+
+    const u32 = (v) => v >>> 0;
+    const pack = (v) => {
+        const n = u32(v);
+        return [n & 0xff, (n >>> 8) & 0xff, (n >>> 16) & 0xff, (n >>> 24) & 0xff];
+    };
+
+    const bytes = [
+        ...pack(x0 ^ x1),
+        ...pack(y0 ^ y1)
+    ];
+    return bytesToHex(new Uint8Array(bytes));
+}
+
+const U32_MASK = 0xFFFFFFFFn;
+
+function u32(value) {
+    return Number(BigInt(value) & U32_MASK);
+}
+
+function rol16(value) {
+    const v = u32(value);
+    return u32((v << 16) | (v >>> 16));
+}
+
+function wordsLe4Even(bytes) {
+    const padded = new Uint8Array(bytes.length + ((4 - (bytes.length % 4)) % 4));
+    padded.set(bytes);
+    const words = [];
+    const view = new DataView(padded.buffer);
+    for (let i = 0; i < padded.length; i += 4) {
+        words.push(view.getUint32(i, true));
+    }
+    if (words.length % 2) words.push(0);
+    return words;
+}
+
+function cs64WordSwap(words, keyWords) {
+    const a = u32(keyWords[0] | 1);
+    const b = u32(keyWords[1] | 1);
+    let acc = 0;
+    let last = 0;
+
+    for (let i = 0; i < words.length; i += 2) {
+        const x = u32(words[i]);
+        const y = u32(words[i + 1] || 0);
+
+        // —— x 分支 ——
+        let t = u32(Number((BigInt(rol16(x)) * 0xEF0569FBn + BigInt(x) * BigInt(a)) & U32_MASK));
+        t = rol16(t);
+
+        let q = u32(Number((BigInt(t) * 0x76F50F34n) & U32_MASK));
+        q = u32(Number((BigInt(rol16(q)) * 0xC3EFEA97n + BigInt(q)) & U32_MASK));
+        acc = u32(Number((BigInt(acc) + BigInt(q)) & U32_MASK));
+
+        // —— y 分支 ——
+        t = u32(Number((BigInt(rol16(y)) * 0xC31713DBn + BigInt(y) * BigInt(b)) & U32_MASK));
+        t = rol16(t);
+
+        q = u32(Number((BigInt(t) * 0x1881CE3Cn) & U32_MASK));
+        last = u32(Number((BigInt(rol16(q)) * 0x35BD1EC9n + BigInt(q)) & U32_MASK));
+        acc = u32(Number((BigInt(acc) + BigInt(last)) & U32_MASK));
+    }
+
+    return [last, acc];
+}
+
+function cs64Reversible(words, keyWords) {
+    const a = u32(keyWords[0] | 1);
+    const b = u32(keyWords[1] | 1);
+    let state = 0;
+    let acc = 0;
+
+    const constants = [0xCF98B111n, 0x87085B9Fn, 0x12CEB96Dn, 0x257E1D83n];
+
+    for (let i = 0; i < words.length; i += 2) {
+        const x = u32(words[i]);
+        const y = u32(words[i + 1] || 0);
+
+        state = u32(Number((BigInt(u32(state + x)) * BigInt(a)) & U32_MASK));
+
+        for (const constant of constants) {
+            state = u32(Number((BigInt(rol16(state)) * constant) & U32_MASK));
+        }
+
+        let t = u32(Number((BigInt(u32(y + state)) * BigInt(b)) & U32_MASK));
+        t = u32(Number((BigInt(rol16(t)) * 0xA27416F5n) & U32_MASK));
+        t = u32(Number((BigInt(rol16(t)) * 0xD38396FFn) & U32_MASK));
+        t = rol16(t);
+
+        acc = u32(Number((BigInt(acc) + BigInt(state)) & U32_MASK));
+        state = u32(Number((BigInt(rol16(u32(Number((BigInt(t) * 0x7C932B89n) & U32_MASK)))) * 0xBFA49F69n) & U32_MASK));
+        acc = u32(Number((BigInt(acc) + BigInt(state)) & U32_MASK));
+    }
+
+    return [state, acc];
 }
 
 function generateConnectionId() {
@@ -2314,23 +2448,18 @@ function generateConnectionId() {
 }
 
 function arrayBufferToBase64(buffer) {
-    let binary = '';
     const bytes = new Uint8Array(buffer);
-    const chunkSize = 0x8000;
-    for (let i = 0; i < bytes.length; i += chunkSize) {
-        binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+    const chunks = [];
+    const CHUNK = 0x8000;
+    for (let i = 0; i < bytes.length; i += CHUNK) {
+        const sub = bytes.subarray(i, Math.min(i + CHUNK, bytes.length));
+        let s = '';
+        for (let j = 0; j < sub.length; j++) s += String.fromCharCode(sub[j]);
+        chunks.push(s);
     }
-    return btoa(binary);
+    return btoa(chunks.join(''));
 }
 
-/**
- * 通过 Edge TTS WebSocket 合成，返回音频块和 WordBoundary 列表
- * Cloudflare Workers 必须通过 fetch + Upgrade 头建立出站 WebSocket，
- * 且 URL 必须使用 https:// 而非 wss://
- *
- * ★ 修复：Cloudflare Workers 的 WebSocket 二进制帧 event.data 是 ArrayBuffer
- *        （不是 Blob），旧代码用 blob.arrayBuffer() 判断，会丢弃所有音频帧。
- */
 async function synthesizeWithWordBoundaries(text, voice, rate, pitch, volume, style) {
     const secMsGec = await generateSecMsGecToken();
     const connectionId = generateConnectionId();
@@ -2349,7 +2478,7 @@ async function synthesizeWithWordBoundaries(text, voice, rate, pitch, volume, st
             'Connection': 'Upgrade',
             'Sec-WebSocket-Version': '13',
             'Origin': 'chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold',
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36 Edg/132.0.0.0',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0',
             'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8'
         }
     });
@@ -2365,7 +2494,11 @@ async function synthesizeWithWordBoundaries(text, voice, rate, pitch, volume, st
         throw new Error('WebSocket 升级失败：response.webSocket 为空');
     }
 
-    ws.accept();
+    try {
+        ws.accept();
+    } catch (e) {
+        // 出站 WebSocket 可能已经 accepted，忽略
+    }
 
     return new Promise((resolve, reject) => {
         const audioChunks = [];
@@ -2423,7 +2556,6 @@ async function synthesizeWithWordBoundaries(text, voice, rate, pitch, volume, st
             }
 
             // —— 二进制帧：兼容 ArrayBuffer / TypedArray / Blob ——
-            // ★ Cloudflare Workers 中 event.data 是 ArrayBuffer，没有 .arrayBuffer() 方法
             let bufferPromise;
             if (data instanceof ArrayBuffer) {
                 bufferPromise = Promise.resolve(data);
@@ -2432,7 +2564,6 @@ async function synthesizeWithWordBoundaries(text, voice, rate, pitch, volume, st
                     data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength)
                 );
             } else if (data && typeof data.arrayBuffer === 'function') {
-                // 兜底：某些环境可能是 Blob
                 bufferPromise = data.arrayBuffer();
             } else {
                 return;
@@ -2515,9 +2646,6 @@ async function synthesizeWithWordBoundaries(text, voice, rate, pitch, volume, st
     });
 }
 
-/**
- * 新端点：返回 base64 音频 + WordBoundary
- */
 async function handleSpeechWithTimings(request) {
     try {
         const requestBody = await request.json();
@@ -2551,7 +2679,6 @@ async function handleSpeechWithTimings(request) {
             });
         }
 
-        // ★ NaN 兜底
         const parsedSpeed = parseFloat(speed);
         const rate = isNaN(parsedSpeed) ? 0 : parseInt(String((parsedSpeed - 1.0) * 100));
         const parsedVolume = parseFloat(volume);
