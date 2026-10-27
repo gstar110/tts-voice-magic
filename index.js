@@ -2347,8 +2347,8 @@ async function synthesizeWithWordBoundaries(text, voice, rate, pitch, volume, st
     const requestId = generateConnectionId();
 
     const url =
-        `https://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1` +
-        `?TrustedClientToken=${EDGE_TTS_TRUSTED_CLIENT_TOKEN}` +
+        `https://api.msedgeservices.com/tts/cognitiveservices/websocket/v1` +
+        `?Ocp-Apim-Subscription-Key=${EDGE_TTS_TRUSTED_CLIENT_TOKEN}` +
         `&Sec-MS-GEC=${secMsGec}` +
         `&Sec-MS-GEC-Version=${EDGE_TTS_SEC_MS_GEC_VERSION}` +
         `&ConnectionId=${connectionId}`;
