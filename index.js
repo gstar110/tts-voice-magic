@@ -8,7 +8,7 @@ let tokenInfo = {
 // ===================== Edge TTS WebSocket 常量（用于 WordBoundary） =====================
 const EDGE_TTS_TRUSTED_CLIENT_TOKEN = "6A5AA1D4EAFF4E9FB37E23D68491D6F4";
 const EDGE_TTS_OUTPUT_FORMAT = "audio-24khz-48kbitrate-mono-mp3";
-const EDGE_TTS_SEC_MS_GEC_VERSION = "2-133.0.3065.92"; // 已更新为 v2 格式
+const EDGE_TTS_SEC_MS_GEC_VERSION = "1-133.0.3065.92";
 
 // HTML 页面模板
 const HTML_PAGE = `
@@ -2291,22 +2291,22 @@ async function handleAudioTranscription(request) {
 // ============================================================================
 
 async function generateSecMsGecToken() {
+    // Windows file-time epoch (1601-01-01 到 1970-01-01 的秒数)
     const WIN_EPOCH = 11644473600n;
-    const S_TO_NS = 10000000n;
+    const S_TO_NS = 10000000n;  // 100ns 单位
+
     const nowSec = BigInt(Math.floor(Date.now() / 1000));
     let ticks = (nowSec + WIN_EPOCH) * S_TO_NS;
-    const roundTo = 300n * 10000000n; // 5分钟窗口
+
+    // 取整到最近的 5 分钟（300 秒 = 3000000000 * 100ns）
+    const roundTo = 300n * 10000000n;
     ticks = (ticks / roundTo) * roundTo;
 
     const input = `${ticks}${EDGE_TTS_TRUSTED_CLIENT_TOKEN}`;
     const data = new TextEncoder().encode(input);
-
-    // 计算 SHA256 哈希，直接返回即可（v2 版本不需要拼接 -）
     const hashBuffer = await crypto.subtle.digest('SHA-256', data);
-    return Array.from(new Uint8Array(hashBuffer))
-        .map(b => b.toString(16).padStart(2, '0'))
-        .join('')
-        .toUpperCase();
+    const hashArray = Array.from(new Uint8Array(hashBuffer));
+    return hashArray.map(b => b.toString(16).padStart(2, '0')).join('').toUpperCase();
 }
 
 function generateConnectionId() {
@@ -2336,9 +2336,8 @@ async function synthesizeWithWordBoundaries(text, voice, rate, pitch, volume, st
     const connectionId = generateConnectionId();
     const requestId = generateConnectionId();
 
-    // 使用最新的 WebSocket 端点
     const url =
-        `https://api.msedgeservices.com/tts/cognitiveservices/websocket/v1` +
+        `https://speech.platform.bing.com/consumer/speech/synthesize/readaloud/edge/v1` +
         `?TrustedClientToken=${EDGE_TTS_TRUSTED_CLIENT_TOKEN}` +
         `&Sec-MS-GEC=${secMsGec}` +
         `&Sec-MS-GEC-Version=${EDGE_TTS_SEC_MS_GEC_VERSION}` +
@@ -2349,7 +2348,7 @@ async function synthesizeWithWordBoundaries(text, voice, rate, pitch, volume, st
             'Upgrade': 'websocket',
             'Connection': 'Upgrade',
             'Sec-WebSocket-Version': '13',
-            // 'Origin': 'chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold', // 如果遇到 403 可以尝试注释掉这一行
+            'Origin': 'chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold',
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36 Edg/132.0.0.0',
             'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8'
         }
@@ -2358,7 +2357,6 @@ async function synthesizeWithWordBoundaries(text, voice, rate, pitch, volume, st
     if (resp.status !== 101) {
         let detail = '';
         try { detail = await resp.text(); } catch (e) {}
-        console.error(`WebSocket 升级失败 (HTTP ${resp.status})`, detail);
         throw new Error(`WebSocket 升级失败 (HTTP ${resp.status})${detail ? ': ' + detail.slice(0, 200) : ''}`);
     }
 
