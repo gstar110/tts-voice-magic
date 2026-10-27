@@ -2356,8 +2356,31 @@ async function synthesizeWithWordBoundaries(text, voice, rate, pitch, volume, st
 
     if (resp.status !== 101) {
         let detail = '';
-        try { detail = await resp.text(); } catch (e) {}
-        throw new Error(`WebSocket 升级失败 (HTTP ${resp.status})${detail ? ': ' + detail.slice(0, 200) : ''}`);
+        try {
+            detail = await resp.text();
+        } catch (e) {
+            detail = `读取响应正文失败: ${e.message}`;
+        }
+    
+        const responseHeaders = {};
+        for (const [key, value] of resp.headers.entries()) {
+            // 不记录可能包含凭据的敏感响应头
+            if (!/cookie|token|authorization|secret/i.test(key)) {
+                responseHeaders[key] = value;
+            }
+        }
+    
+        console.error('Edge TTS upstream rejection:', JSON.stringify({
+            status: resp.status,
+            statusText: resp.statusText,
+            headers: responseHeaders,
+            body: detail.slice(0, 500)
+        }));
+    
+        throw new Error(
+            `WebSocket 升级失败 (HTTP ${resp.status})` +
+            (detail ? `: ${detail.slice(0, 200)}` : '')
+        );
     }
 
     const ws = resp.webSocket;
