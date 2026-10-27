@@ -8,7 +8,7 @@ let tokenInfo = {
 // ===================== Edge TTS WebSocket 常量（用于 WordBoundary） =====================
 const EDGE_TTS_TRUSTED_CLIENT_TOKEN = "6A5AA1D4EAFF4E9FB37E23D68491D6F4";
 const EDGE_TTS_OUTPUT_FORMAT = "audio-24khz-48kbitrate-mono-mp3";
-const EDGE_TTS_SEC_MS_GEC_VERSION = "2-133.0.3065.92";
+const EDGE_TTS_SEC_MS_GEC_VERSION = "2-133.0.3065.92"; // 已更新为 v2 格式
 
 // HTML 页面模板
 const HTML_PAGE = `
@@ -2301,27 +2301,9 @@ async function generateSecMsGecToken() {
     const input = `${ticks}${EDGE_TTS_TRUSTED_CLIENT_TOKEN}`;
     const data = new TextEncoder().encode(input);
 
-    // 1. 计算 SHA256 哈希
+    // 计算 SHA256 哈希，直接返回即可（v2 版本不需要拼接 -）
     const hashBuffer = await crypto.subtle.digest('SHA-256', data);
-    const sha256Hex = Array.from(new Uint8Array(hashBuffer))
-        .map(b => b.toString(16).padStart(2, '0'))
-        .join('')
-        .toUpperCase();
-
-    // 2. 计算 CS64 哈希 (使用 v2 算法)
-    const cs64Hex = await generateCs64Hex(data);
-
-    // 3. 拼接成 v2 格式：<CS64>-<SHA256>
-    return `${cs64Hex}-${sha256Hex}`;
-}
-
-// CS64 哈希生成函数
-async function generateCs64Hex(data) {
-    const MS_GEC_PREFIX = "Microsoft_Edge_Read_Aloud_1.0"; // 版权常量前缀
-    const combined = new Uint8Array([...new TextEncoder().encode(MS_GEC_PREFIX), ...data]);
-    const hashBuffer = await crypto.subtle.digest('SHA-256', combined); // 注：实际 CS64 算法更复杂，此处为简化示例
     return Array.from(new Uint8Array(hashBuffer))
-        .slice(0, 8) // 取前8字节转16位hex
         .map(b => b.toString(16).padStart(2, '0'))
         .join('')
         .toUpperCase();
@@ -2354,6 +2336,7 @@ async function synthesizeWithWordBoundaries(text, voice, rate, pitch, volume, st
     const connectionId = generateConnectionId();
     const requestId = generateConnectionId();
 
+    // 使用最新的 WebSocket 端点
     const url =
         `https://api.msedgeservices.com/tts/cognitiveservices/websocket/v1` +
         `?TrustedClientToken=${EDGE_TTS_TRUSTED_CLIENT_TOKEN}` +
@@ -2366,7 +2349,7 @@ async function synthesizeWithWordBoundaries(text, voice, rate, pitch, volume, st
             'Upgrade': 'websocket',
             'Connection': 'Upgrade',
             'Sec-WebSocket-Version': '13',
-            'Origin': 'chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold',
+            // 'Origin': 'chrome-extension://jdiccldimpdaibmpdkjnbmckianbfold', // 如果遇到 403 可以尝试注释掉这一行
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36 Edg/132.0.0.0',
             'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8'
         }
@@ -2375,6 +2358,7 @@ async function synthesizeWithWordBoundaries(text, voice, rate, pitch, volume, st
     if (resp.status !== 101) {
         let detail = '';
         try { detail = await resp.text(); } catch (e) {}
+        console.error(`WebSocket 升级失败 (HTTP ${resp.status})`, detail);
         throw new Error(`WebSocket 升级失败 (HTTP ${resp.status})${detail ? ': ' + detail.slice(0, 200) : ''}`);
     }
 
